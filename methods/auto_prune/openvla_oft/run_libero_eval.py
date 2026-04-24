@@ -21,6 +21,7 @@ import tqdm
 from libero.libero import benchmark
 ##autoprune
 sys.path.append(os.getcwd())
+sys.path.append(str(Path(__file__).resolve().parent))
 try:
     from autoprune_patch_improved import AutoPrunePatchImproved as AutoPrunePatchModern
 except Exception:
@@ -32,6 +33,7 @@ except Exception:
     ComparePruningConfig = None
     ComparePruningPatch = None
 from fastv_patch import FastVConfig, maybe_apply_fastv_patch
+from sparsevlm_patch import SparseVLMConfig, maybe_apply_sparsevlm_patch
 import wandb
 import time
 
@@ -183,6 +185,21 @@ class GenerateConfig:
     fastv_debug: bool = False                        # Extra debug prints from the patch
 
     #################################################################################################################
+    # SparseVLM baseline (Zhang et al. 2025)
+    #################################################################################################################
+    use_sparsevlm_pruning: bool = False              # Whether to enable standalone SparseVLM pruning
+    sparsevlm_target_visual_tokens: int = 128        # Budget projection target for final visual tokens
+    sparsevlm_visual_tokens: int = 512               # Unified visual token pool across all views
+    sparsevlm_pruning_start_layer: int = 1           # 1-based layer where progressive sparsification starts
+    sparsevlm_lambda: float = 1.0                    # Deletion pressure from redundancy signal
+    sparsevlm_recycle_top_ratio: float = 0.5         # Fraction of deleted tokens eligible for rescue
+    sparsevlm_cluster_ratio: float = 0.25            # Number of clusters as a fraction of rescued tokens
+    sparsevlm_rank_tolerance: float = 1e-4           # Numerical threshold for effective-rank SVD
+    sparsevlm_knn_k: int = 8                         # k-NN size for density-peak clustering
+    sparsevlm_min_prune_tokens: int = 1              # Minimum progress per pruning layer while above target
+    sparsevlm_debug: bool = False                    # Extra debug prints from the patch
+
+    #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite
@@ -239,6 +256,15 @@ def validate_config(cfg: GenerateConfig) -> None:
         assert cfg.fastv_keep_visual_tokens > 0, "fastv_keep_visual_tokens must be positive!"
         assert cfg.fastv_visual_tokens > 0, "fastv_visual_tokens must be positive!"
         assert cfg.fastv_pruning_layer > 0, "fastv_pruning_layer K must be positive!"
+    if cfg.use_sparsevlm_pruning:
+        assert cfg.sparsevlm_target_visual_tokens > 0, "sparsevlm_target_visual_tokens must be positive!"
+        assert cfg.sparsevlm_visual_tokens > 0, "sparsevlm_visual_tokens must be positive!"
+        assert cfg.sparsevlm_pruning_start_layer > 0, "sparsevlm_pruning_start_layer must be positive!"
+        assert cfg.sparsevlm_lambda >= 0.0, "sparsevlm_lambda must be non-negative!"
+        assert 0.0 <= cfg.sparsevlm_recycle_top_ratio <= 1.0, "sparsevlm_recycle_top_ratio must be in [0, 1]!"
+        assert 0.0 <= cfg.sparsevlm_cluster_ratio <= 1.0, "sparsevlm_cluster_ratio must be in [0, 1]!"
+        assert cfg.sparsevlm_rank_tolerance >= 0.0, "sparsevlm_rank_tolerance must be non-negative!"
+        assert cfg.sparsevlm_knn_k > 0, "sparsevlm_knn_k must be positive!"
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -471,6 +497,8 @@ def run_episode(
                     patch_ref = getattr(model, "_compare_patch_ref", None)
                 if patch_ref is None:
                     patch_ref = getattr(model, "_fastv_patch_ref", None)
+                if patch_ref is None:
+                    patch_ref = getattr(model, "_sparsevlm_patch_ref", None)
                 if patch_ref is not None:
                     stats = dict(getattr(patch_ref, "latest_stats", {}) or {})
                     keep_count_schedule = stats.get("keep_count_schedule") or []
@@ -692,10 +720,16 @@ def eval_libero(cfg: GenerateConfig) -> float:
     ENABLE_AUTOPRUNE = cfg.use_auto_prune
     ENABLE_COMPARE_PRUNING = cfg.use_compare_pruning
     ENABLE_FASTV_PRUNING = cfg.use_fastv_pruning
+    ENABLE_SPARSEVLM_PRUNING = cfg.use_sparsevlm_pruning
 
-    enabled_pruners = int(bool(ENABLE_AUTOPRUNE)) + int(bool(ENABLE_COMPARE_PRUNING)) + int(bool(ENABLE_FASTV_PRUNING))
+    enabled_pruners = (
+        int(bool(ENABLE_AUTOPRUNE))
+        + int(bool(ENABLE_COMPARE_PRUNING))
+        + int(bool(ENABLE_FASTV_PRUNING))
+        + int(bool(ENABLE_SPARSEVLM_PRUNING))
+    )
     if enabled_pruners > 1:
-        raise ValueError("Please enable only one of AutoPrune, compare pruning baselines, or standalone FastV.")
+        raise ValueError("Please enable only one of AutoPrune, compare pruning baselines, FastV, or SparseVLM.")
 
     if ENABLE_AUTOPRUNE:
         print("\n" + "="*40)
@@ -823,6 +857,33 @@ def eval_libero(cfg: GenerateConfig) -> float:
             print("✅ FastV successfully patched!")
         except Exception as e:
             print(f"❌ Failed to apply FastV: {e}")
+            import traceback
+            traceback.print_exc()
+
+    if ENABLE_SPARSEVLM_PRUNING:
+        print("\n" + "="*40)
+        print("🪶 Activating SparseVLM baseline (standalone unified visual pool)...")
+        print("="*40 + "\n")
+        try:
+            sparsevlm_cfg = SparseVLMConfig(
+                enabled=True,
+                target_visual_tokens=cfg.sparsevlm_target_visual_tokens,
+                visual_tokens=cfg.sparsevlm_visual_tokens,
+                pruning_start_layer=cfg.sparsevlm_pruning_start_layer,
+                lambda_scale=cfg.sparsevlm_lambda,
+                recycle_top_ratio=cfg.sparsevlm_recycle_top_ratio,
+                cluster_ratio=cfg.sparsevlm_cluster_ratio,
+                rank_tolerance=cfg.sparsevlm_rank_tolerance,
+                knn_k=cfg.sparsevlm_knn_k,
+                min_prune_tokens=cfg.sparsevlm_min_prune_tokens,
+                debug=cfg.sparsevlm_debug,
+            )
+            sparsevlm_patcher = maybe_apply_sparsevlm_patch(model=model, config=sparsevlm_cfg)
+            setattr(model, "_sparsevlm_patch_ref", sparsevlm_patcher)
+            setattr(model, "_compare_patch_ref", sparsevlm_patcher)
+            print("✅ SparseVLM successfully patched!")
+        except Exception as e:
+            print(f"❌ Failed to apply SparseVLM: {e}")
             import traceback
             traceback.print_exc()
             

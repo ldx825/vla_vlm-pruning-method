@@ -48,6 +48,14 @@ class MantisBaselinePruneConfig:
     pyramiddrop_start_layer: int = 2
     pyramiddrop_max_pruning_layers: int = 6
     pyramiddrop_layer_indices: Tuple[int, ...] = ()
+    fastv_pruning_layer: int = 2
+    sparsevlm_start_layer: int = 2
+    sparsevlm_max_pruning_layers: int = 6
+    sparsevlm_layer_indices: Tuple[int, ...] = ()
+    sparsevlm_recycle_top_ratio: float = 0.5
+    sparsevlm_cluster_ratio: float = 0.25
+    sparsevlm_rank_tolerance: float = 1e-4
+    sparsevlm_min_prune_tokens: int = 1
 
 
 def build_mantis_baseline_config_from_env(prefix: str = "MANTIS_BASELINE_PRUNE_") -> MantisBaselinePruneConfig:
@@ -62,6 +70,14 @@ def build_mantis_baseline_config_from_env(prefix: str = "MANTIS_BASELINE_PRUNE_"
         pyramiddrop_start_layer=_parse_int(f"{prefix}PYRAMIDDROP_START_LAYER", 2),
         pyramiddrop_max_pruning_layers=_parse_int(f"{prefix}PYRAMIDDROP_MAX_PRUNING_LAYERS", 6),
         pyramiddrop_layer_indices=_parse_int_tuple(f"{prefix}PYRAMIDDROP_LAYER_INDICES", ()),
+        fastv_pruning_layer=_parse_int(f"{prefix}FASTV_PRUNING_LAYER", 2),
+        sparsevlm_start_layer=_parse_int(f"{prefix}SPARSEVLM_START_LAYER", 2),
+        sparsevlm_max_pruning_layers=_parse_int(f"{prefix}SPARSEVLM_MAX_PRUNING_LAYERS", 6),
+        sparsevlm_layer_indices=_parse_int_tuple(f"{prefix}SPARSEVLM_LAYER_INDICES", ()),
+        sparsevlm_recycle_top_ratio=_parse_float(f"{prefix}SPARSEVLM_RECYCLE_TOP_RATIO", 0.5),
+        sparsevlm_cluster_ratio=_parse_float(f"{prefix}SPARSEVLM_CLUSTER_RATIO", 0.25),
+        sparsevlm_rank_tolerance=_parse_float(f"{prefix}SPARSEVLM_RANK_TOLERANCE", 1e-4),
+        sparsevlm_min_prune_tokens=_parse_int(f"{prefix}SPARSEVLM_MIN_PRUNE_TOKENS", 1),
     )
 
 
@@ -73,6 +89,9 @@ def normalize_method_name(method: Optional[str]) -> str:
         "visionzip": "visionzip",
         "pyramiddrop": "pyramiddrop",
         "pdrop": "pyramiddrop",
+        "fastv": "fastv",
+        "sparsevlm": "sparsevlm",
+        "sparsevlms": "sparsevlm",
     }
     if value not in aliases:
         raise ValueError(f"Unknown Mantis baseline pruning method: {method!r}")

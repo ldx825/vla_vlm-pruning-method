@@ -24,6 +24,12 @@ class NoraBaselinePruningConfig:
     max_pruning_layers: int = 6
     layer_indices: Tuple[int, ...] = ()
     visionzip_dominant_ratio: float = 0.7
+    sparsevlm_lambda: float = 1.0
+    sparsevlm_recycle_top_ratio: float = 0.5
+    sparsevlm_cluster_ratio: float = 0.25
+    sparsevlm_rank_tolerance: float = 1e-4
+    sparsevlm_knn_k: int = 8
+    sparsevlm_min_prune_tokens: int = 1
     action_token_min: int = 151665
     action_token_max: int = 153712
     detailed_timing: bool = True
@@ -39,6 +45,9 @@ def _normalize_method(method: str) -> str:
         "visionzip": "visionzip",
         "pyramiddrop": "pyramiddrop",
         "pdrop": "pyramiddrop",
+        "fastv": "fastv",
+        "sparsevlm": "sparsevlm",
+        "sparsevlms": "sparsevlm",
     }
     if value not in aliases:
         raise ValueError(f"Unknown NORA baseline pruning method: {method!r}")
@@ -209,6 +218,57 @@ def _pyramiddrop_schedule(initial_tokens: int, target_avg_tokens: int, stages: i
     return counts, lam
 
 
+def _effective_rank(tokens: torch.Tensor, tolerance: float) -> torch.Tensor:
+    if tokens.numel() == 0 or tokens.shape[1] <= 1:
+        return tokens.new_tensor(1.0)
+    x = tokens[0].float()
+    x = x - x.mean(dim=0, keepdim=True)
+    try:
+        sigmas = torch.linalg.svdvals(x)
+    except Exception:
+        return tokens.new_tensor(float(max(1, min(tokens.shape[1], tokens.shape[-1]))))
+    sigmas = sigmas[sigmas > float(tolerance)]
+    if sigmas.numel() == 0:
+        return tokens.new_tensor(1.0)
+    probs = sigmas / sigmas.sum().clamp(min=1e-8)
+    entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum()
+    return torch.exp(entropy).to(device=tokens.device, dtype=tokens.dtype)
+
+
+def _cluster_and_merge(tokens: torch.Tensor, cluster_num: int, knn_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    bsz, token_num, dim = tokens.shape
+    cluster_num = max(1, min(int(cluster_num), int(token_num)))
+    if token_num <= cluster_num:
+        reps = torch.arange(token_num, dtype=torch.long, device=tokens.device).unsqueeze(0).expand(bsz, -1)
+        return tokens, reps
+
+    normalized = F.normalize(tokens.float(), dim=-1)
+    dist_matrix = torch.cdist(normalized, normalized, p=2).to(tokens.dtype)
+    k = max(1, min(int(knn_k), token_num))
+    nearest_dist, _ = torch.topk(dist_matrix, k=k, dim=-1, largest=False)
+    density = torch.exp(-(nearest_dist.float() ** 2).mean(dim=-1)).to(tokens.dtype)
+    density = density + torch.rand_like(density) * 1e-6
+
+    higher_density = density[:, None, :] > density[:, :, None]
+    dist_max = dist_matrix.flatten(1).max(dim=-1)[0][:, None, None]
+    dist_to_higher, _ = (dist_matrix * higher_density + dist_max * (~higher_density)).min(dim=-1)
+    center_score = density * dist_to_higher
+    centers = torch.topk(center_score, k=cluster_num, dim=-1).indices
+
+    center_tokens = tokens.gather(1, centers.unsqueeze(-1).expand(-1, -1, dim)).float()
+    assign_dist = torch.cdist(tokens.float(), center_tokens, p=2)
+    assignments = assign_dist.argmin(dim=-1)
+    batch_idx = torch.arange(bsz, device=tokens.device)[:, None]
+    assignments[batch_idx.expand_as(centers), centers] = torch.arange(cluster_num, device=tokens.device)[None, :]
+
+    merged = tokens.new_zeros(bsz, cluster_num, dim)
+    weights = tokens.new_zeros(bsz, cluster_num, 1)
+    merged.scatter_add_(1, assignments.unsqueeze(-1).expand(-1, -1, dim), tokens)
+    weights.scatter_add_(1, assignments.unsqueeze(-1), tokens.new_ones(bsz, token_num, 1))
+    merged = merged / weights.clamp(min=1.0)
+    return merged, centers
+
+
 class NoraBaselinePruningPatch:
     def __init__(self, model, config: NoraBaselinePruningConfig):
         self.model = model
@@ -243,6 +303,11 @@ class NoraBaselinePruningPatch:
         raise RuntimeError("Unable to locate decoder layers for NORA baseline pruning.")
 
     def _build_pruning_layers(self) -> List[int]:
+        if self.method == "fastv":
+            # FastV paper uses K as "run first K layers, prune after layer K".
+            # Externally we keep that 1-based convention for FastV.
+            idx = max(0, min(int(self.config.start_layer) - 1, len(self.layers) - 1))
+            return [idx]
         if self.config.layer_indices:
             return [int(idx) for idx in self.config.layer_indices if 0 <= int(idx) < len(self.layers)]
         candidates = list(range(max(0, int(self.config.start_layer)), len(self.layers)))
@@ -269,6 +334,10 @@ class NoraBaselinePruningPatch:
         self.original_forward = self.model.forward
         self.model.forward = types.MethodType(self._make_model_forward(), self.model)
         if self.method == "pyramiddrop":
+            for idx, layer in enumerate(self.layers):
+                self.original_layer_forwards[idx] = layer.forward
+                layer.forward = types.MethodType(self._make_layer_forward(idx), layer)
+        if self.method in {"fastv", "sparsevlm"}:
             for idx, layer in enumerate(self.layers):
                 self.original_layer_forwards[idx] = layer.forward
                 layer.forward = types.MethodType(self._make_layer_forward(idx), layer)
@@ -576,6 +645,62 @@ class NoraBaselinePruningPatch:
                 score = score.masked_fill(~valid_visual, torch.finfo(score.dtype).min)
             return torch.nan_to_num(score.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
+    def _select_sparsevlm_raters(self, hidden_states: torch.Tensor, visual_positions: torch.Tensor, text_positions: torch.Tensor) -> torch.Tensor:
+        # SparseVLM Step 1: select text raters that are truly image-related.
+        # Only non-action instruction/text tokens are allowed here. This differs
+        # from FastV, whose attention score intentionally includes action tokens.
+        if visual_positions.numel() <= 0 or text_positions.numel() <= 0:
+            return text_positions
+        visual_tokens = hidden_states[:, visual_positions, :]
+        text_tokens = hidden_states[:, text_positions, :]
+        affinity = torch.matmul(visual_tokens.float(), text_tokens.float().transpose(1, 2))
+        relevance = affinity.softmax(dim=-1).mean(dim=1)[0]
+        keep = relevance > relevance.mean()
+        raters = text_positions[keep]
+        if raters.numel() <= 0:
+            raters = text_positions[relevance.topk(1).indices]
+        return raters.contiguous()
+
+    @staticmethod
+    def _attention_scores_from_raters(attn_weights: torch.Tensor, visual_positions: torch.Tensor, rater_positions: torch.Tensor) -> torch.Tensor:
+        # attn_weights: [B, Heads, Query, Key]. Average heads and selected raters.
+        if visual_positions.numel() <= 0 or rater_positions.numel() <= 0:
+            return torch.empty((attn_weights.shape[0], 0), dtype=attn_weights.dtype, device=attn_weights.device)
+        relation = attn_weights[:, :, rater_positions, :][:, :, :, visual_positions]
+        return torch.nan_to_num(relation.mean(dim=1).mean(dim=1).float(), nan=0.0, posinf=0.0, neginf=0.0)
+
+    @staticmethod
+    def _build_full_indices_from_visual(batch_size: int, seq_len: int, visual_positions: torch.Tensor, selected_visual: torch.Tensor, device) -> torch.Tensor:
+        keep = torch.ones((batch_size, seq_len), dtype=torch.bool, device=device)
+        if visual_positions.numel() > 0:
+            keep[:, visual_positions] = False
+        if selected_visual.numel() > 0:
+            keep.scatter_(1, selected_visual, True)
+        base = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
+        return base[keep].view(batch_size, -1)
+
+    def _sparsevlm_counts(self, visual_tokens: torch.Tensor, layer_idx: int) -> Tuple[int, int, int, float, float]:
+        current_v = int(visual_tokens.shape[1])
+        target = max(1, min(int(self.config.target_token_num), current_v))
+        remaining_layers = max(1, len([idx for idx in self.pruning_layers if idx >= layer_idx]))
+        rank = _effective_rank(visual_tokens, float(self.config.sparsevlm_rank_tolerance))
+        rank_value = float(rank.detach().cpu().item())
+        redundancy = max(0.0, min(1.0, 1.0 - rank_value / float(max(1, current_v))))
+        # SparseVLM Step 3: adaptive deletion from rank/redundancy, then a
+        # budget-constrained projection so experiments can sweep final budgets.
+        delete_count = int(round(float(self.config.sparsevlm_lambda) * redundancy * current_v))
+        if current_v > target:
+            min_progress = max(
+                int(self.config.sparsevlm_min_prune_tokens),
+                int(math.ceil((current_v - target) / float(remaining_layers))),
+            )
+            delete_count = max(delete_count, min_progress)
+        delete_count = max(0, min(delete_count, max(0, current_v - target)))
+        rescue_count = max(0, min(delete_count, int(round(delete_count * float(self.config.sparsevlm_recycle_top_ratio)))))
+        cluster_count = max(0, min(rescue_count, int(round(rescue_count * float(self.config.sparsevlm_cluster_ratio)))))
+        keep_direct = current_v - delete_count
+        return keep_direct, rescue_count, cluster_count, rank_value, redundancy
+
     def _make_layer_forward(self, layer_idx: int):
         def new_forward(layer_self, hidden_states, attention_mask=None, position_ids=None, **kwargs):
             patch_t0 = time.perf_counter()
@@ -593,6 +718,15 @@ class NoraBaselinePruningPatch:
                     attention_mask = None
                 self._align_position_embeddings(self.global_indices, kwargs, batch_size, seq_len)
 
+            original_output_attentions = bool(kwargs.get("output_attentions", False))
+            need_attention = (
+                not is_decode
+                and self.method in {"fastv", "sparsevlm"}
+                and layer_idx in self.pruning_layers
+            )
+            original_use_cache = bool(kwargs.get("use_cache", False))
+            kwargs["output_attentions"] = bool(original_output_attentions or need_attention)
+
             forward_t0 = time.perf_counter()
             outputs = self.original_layer_forwards[layer_idx](
                 hidden_states,
@@ -603,15 +737,162 @@ class NoraBaselinePruningPatch:
             self.runtime_stats["regular_forward_seconds"] += time.perf_counter() - forward_t0
             self.runtime_stats["patch_total_seconds"] += time.perf_counter() - patch_t0
 
+            def clean_outputs(hidden_override=None):
+                hidden = outputs[0] if hidden_override is None else hidden_override
+                if original_output_attentions:
+                    return (hidden,) + tuple(outputs[1:])
+                if not need_attention:
+                    return outputs if hidden_override is None else (hidden,) + tuple(outputs[1:])
+                if original_use_cache and len(outputs) >= 3:
+                    return (hidden, outputs[2])
+                return (hidden,)
+
             if is_decode or layer_idx not in self.pruning_layers:
-                return outputs
+                return clean_outputs()
 
             layout = self._layout_state(seq_len, hidden_states.device)
             visual_positions = layout["visual_positions"]
             always_keep = layout["always_keep_positions"]
             query_positions = layout["query_positions"]
-            if visual_positions.numel() <= 0 or query_positions.numel() <= 0:
-                return outputs
+            if visual_positions.numel() <= 0:
+                return clean_outputs()
+
+            if self.method == "fastv":
+                # FastV Step 1/2: run the first K layers normally; at layer K,
+                # score each visual token by attention from every other token in
+                # the current sequence. This includes action tokens, as requested.
+                attn_weights = outputs[1] if len(outputs) > 1 else None
+                if attn_weights is None:
+                    return clean_outputs()
+                score_t0 = time.perf_counter()
+                all_query = torch.ones(seq_len, dtype=torch.bool, device=hidden_states.device)
+                all_query[visual_positions] = False
+                query_all = torch.nonzero(all_query, as_tuple=False).flatten()
+                score = self._attention_scores_from_raters(attn_weights, visual_positions, query_all)
+                keep_count = _clamp_keep(int(self.config.target_token_num), int(visual_positions.numel()))
+                if keep_count >= int(visual_positions.numel()):
+                    self.runtime_stats["last_tokens_before"] = int(visual_positions.numel())
+                    self.runtime_stats["last_tokens_after"] = int(visual_positions.numel())
+                    return clean_outputs()
+                _, topk = torch.topk(score, keep_count, dim=1)
+                topk = torch.sort(topk, dim=1).values
+                selected = visual_positions.unsqueeze(0).expand(batch_size, -1).gather(1, topk)
+                self.runtime_stats["topk_seconds"] += time.perf_counter() - score_t0
+
+                # FastV Step 3/4: convert paper ratio R into a final keep count
+                # and physically compact the sequence for all later layers.
+                gather_t0 = time.perf_counter()
+                full_indices = self._build_full_indices_from_visual(batch_size, seq_len, visual_positions, selected, hidden_states.device)
+                new_hidden = outputs[0].gather(1, full_indices.unsqueeze(-1).expand(-1, -1, outputs[0].size(-1))).contiguous()
+                if self.global_indices is not None:
+                    current = self.global_indices
+                    if current.shape[0] == 1 and batch_size > 1:
+                        current = current.expand(batch_size, -1)
+                    self.global_indices = current.gather(1, full_indices)
+                self.runtime_stats["gather_seconds"] += time.perf_counter() - gather_t0
+                before = int(visual_positions.numel())
+                after = int(keep_count)
+                self.runtime_stats["last_tokens_before"] = before
+                self.runtime_stats["last_tokens_after"] = after
+                self.runtime_stats["final_visual_tokens"] = float(after)
+                self.runtime_stats["reduction_ratio"] = 1.0 - float(after) / float(max(1, before))
+                self.runtime_stats["pruned_layers"] = 1
+                self.runtime_stats["method_overhead_seconds"] = self.runtime_stats["topk_seconds"] + self.runtime_stats["gather_seconds"]
+                self.runtime_stats["flops_reduction"] = _estimate_flops_reduction(seq_len, before, after)
+                if self.config.debug:
+                    print(f"[NoraBaseline:fastv] layer={layer_idx} visual {before}->{after}, seq {seq_len}->{full_indices.shape[1]}")
+                return clean_outputs(hidden_override=new_hidden)
+
+            if self.method == "sparsevlm":
+                # SparseVLM Step 1: use only text/instruction tokens as raters.
+                # `query_positions` was prepared from input_ids with action token
+                # ids excluded, so action tokens are not mixed into SparseVLM's
+                # rater set.
+                attn_weights = outputs[1] if len(outputs) > 1 else None
+                if attn_weights is None or query_positions.numel() <= 0:
+                    return clean_outputs()
+                rater_t0 = time.perf_counter()
+                raters = self._select_sparsevlm_raters(outputs[0], visual_positions, query_positions)
+                self.runtime_stats["metric_seconds"] += time.perf_counter() - rater_t0
+                if raters.numel() <= 0:
+                    return clean_outputs()
+
+                # SparseVLM Step 2: text raters score visual tokens through
+                # decoder attention.
+                score_t0 = time.perf_counter()
+                score = self._attention_scores_from_raters(attn_weights, visual_positions, raters)
+                visual_tokens = outputs[0].index_select(1, visual_positions)
+                keep_direct, rescue_count, cluster_count, rank_value, redundancy = self._sparsevlm_counts(visual_tokens, layer_idx)
+                self.runtime_stats["effective_rank"] = float(rank_value)
+                self.runtime_stats["redundancy"] = float(redundancy)
+                self.runtime_stats["rank_seconds"] += time.perf_counter() - score_t0
+                if keep_direct >= int(visual_positions.numel()) and cluster_count <= 0:
+                    self.runtime_stats["last_tokens_before"] = int(visual_positions.numel())
+                    self.runtime_stats["last_tokens_after"] = int(visual_positions.numel())
+                    return clean_outputs()
+
+                # SparseVLM Step 3/4: keep high-priority visual tokens, rescue a
+                # subset of deleted tokens, cluster/merge rescued tokens, then
+                # rebuild a physically shorter sequence.
+                gather_t0 = time.perf_counter()
+                order = torch.argsort(score, dim=1, descending=True)
+                keep_local = torch.sort(order[:, :keep_direct], dim=1).values
+                deleted_local = order[:, keep_direct:]
+                kept_visual = visual_positions.unsqueeze(0).expand(batch_size, -1).gather(1, keep_local)
+                kept_hidden = outputs[0].gather(1, kept_visual.unsqueeze(-1).expand(-1, -1, outputs[0].size(-1)))
+                current = self.global_indices
+                if current is not None and current.shape[0] == 1 and batch_size > 1:
+                    current = current.expand(batch_size, -1)
+                kept_global = current.gather(1, kept_visual) if current is not None else kept_visual
+
+                merged_hidden = outputs[0].new_empty(batch_size, 0, outputs[0].size(-1))
+                merged_global = kept_visual.new_empty(batch_size, 0)
+                if deleted_local.shape[1] > 0 and rescue_count > 0 and cluster_count > 0:
+                    deleted_scores = score.gather(1, deleted_local)
+                    rescue_in_deleted = torch.topk(deleted_scores, k=min(rescue_count, deleted_scores.shape[1]), dim=1).indices
+                    rescue_local = deleted_local.gather(1, rescue_in_deleted)
+                    rescue_pos = visual_positions.unsqueeze(0).expand(batch_size, -1).gather(1, rescue_local)
+                    rescue_hidden = outputs[0].gather(1, rescue_pos.unsqueeze(-1).expand(-1, -1, outputs[0].size(-1)))
+                    merged_hidden, rep_local = _cluster_and_merge(rescue_hidden, cluster_count, int(self.config.sparsevlm_knn_k))
+                    rescue_global = current.gather(1, rescue_pos) if current is not None else rescue_pos
+                    merged_global = rescue_global.gather(1, rep_local)
+                    self.runtime_stats["recycled_tokens"] = int(self.runtime_stats.get("recycled_tokens", 0) + rescue_count)
+                    self.runtime_stats["merged_tokens"] = int(self.runtime_stats.get("merged_tokens", 0) + merged_hidden.shape[1])
+
+                non_visual_mask = torch.ones(seq_len, dtype=torch.bool, device=hidden_states.device)
+                non_visual_mask[visual_positions] = False
+                non_visual_pos = torch.nonzero(non_visual_mask, as_tuple=False).flatten().unsqueeze(0).expand(batch_size, -1)
+                non_visual_hidden = outputs[0].gather(1, non_visual_pos.unsqueeze(-1).expand(-1, -1, outputs[0].size(-1)))
+                non_visual_global = current.gather(1, non_visual_pos) if current is not None else non_visual_pos
+                visual_hidden = torch.cat([kept_hidden, merged_hidden], dim=1)
+                visual_global = torch.cat([kept_global, merged_global], dim=1)
+                if visual_global.shape[1] > 1:
+                    visual_order = torch.argsort(visual_global, dim=1)
+                    visual_hidden = visual_hidden.gather(1, visual_order.unsqueeze(-1).expand(-1, -1, visual_hidden.size(-1)))
+                    visual_global = visual_global.gather(1, visual_order)
+                bos_hidden = non_visual_hidden[:, :1, :]
+                suffix_hidden = non_visual_hidden[:, 1:, :]
+                new_hidden = torch.cat([bos_hidden, visual_hidden, suffix_hidden], dim=1).contiguous()
+                self.global_indices = torch.cat([non_visual_global[:, :1], visual_global, non_visual_global[:, 1:]], dim=1)
+
+                before = int(visual_positions.numel())
+                after = int(visual_hidden.shape[1])
+                self.runtime_stats["gather_seconds"] += time.perf_counter() - gather_t0
+                self.runtime_stats["last_tokens_before"] = before
+                self.runtime_stats["last_tokens_after"] = after
+                self.runtime_stats["final_visual_tokens"] = float(after)
+                self.runtime_stats["pruned_layers"] = int(self.runtime_stats.get("pruned_layers", 0) + 1)
+                self.runtime_stats["keep_count_schedule"] = list(self.runtime_stats.get("keep_count_schedule", [])) + [int(after)]
+                self.runtime_stats["method_overhead_seconds"] = (
+                    self.runtime_stats["metric_seconds"] + self.runtime_stats["rank_seconds"] + self.runtime_stats["gather_seconds"]
+                )
+                self.runtime_stats["flops_reduction"] = _estimate_flops_reduction(seq_len, before, after)
+                if self.config.debug:
+                    print(f"[NoraBaseline:sparsevlm] layer={layer_idx} visual {before}->{after}, seq {seq_len}->{new_hidden.shape[1]}")
+                return clean_outputs(hidden_override=new_hidden)
+
+            if query_positions.numel() <= 0:
+                return clean_outputs()
 
             if not self.keep_schedule:
                 self.keep_schedule, lam = _pyramiddrop_schedule(
@@ -629,7 +910,7 @@ class NoraBaselinePruningPatch:
             if keep_count >= int(visual_positions.numel()):
                 self.runtime_stats["last_tokens_before"] = int(visual_positions.numel())
                 self.runtime_stats["last_tokens_after"] = int(visual_positions.numel())
-                return outputs
+                return clean_outputs()
 
             score_t0 = time.perf_counter()
             # PyramidDrop uses the last instruction token as query. We explicitly
@@ -661,7 +942,7 @@ class NoraBaselinePruningPatch:
             self.runtime_stats["flops_reduction"] = _estimate_flops_reduction(seq_len, before, after)
             if self.config.debug:
                 print(f"[NoraBaseline:pyramiddrop] layer={layer_idx} visual {before}->{after}, seq {seq_len}->{full_indices.shape[1]}")
-            return (new_hidden,) + tuple(outputs[1:])
+            return clean_outputs(hidden_override=new_hidden)
 
         return new_forward
 

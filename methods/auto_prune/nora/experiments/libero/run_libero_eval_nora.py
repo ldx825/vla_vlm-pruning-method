@@ -332,6 +332,12 @@ class GenerateConfig:
     baseline_max_pruning_layers: int = 6
     baseline_layer_indices: tuple[int, ...] = tuple()
     baseline_visionzip_dominant_ratio: float = 0.7
+    baseline_sparsevlm_lambda: float = 1.0
+    baseline_sparsevlm_recycle_top_ratio: float = 0.5
+    baseline_sparsevlm_cluster_ratio: float = 0.25
+    baseline_sparsevlm_rank_tolerance: float = 1e-4
+    baseline_sparsevlm_knn_k: int = 8
+    baseline_sparsevlm_min_prune_tokens: int = 1
     baseline_debug: bool = False
 
     #################################################################################################################
@@ -464,6 +470,12 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
             max_pruning_layers=cfg.baseline_max_pruning_layers,
             layer_indices=cfg.baseline_layer_indices,
             visionzip_dominant_ratio=cfg.baseline_visionzip_dominant_ratio,
+            sparsevlm_lambda=cfg.baseline_sparsevlm_lambda,
+            sparsevlm_recycle_top_ratio=cfg.baseline_sparsevlm_recycle_top_ratio,
+            sparsevlm_cluster_ratio=cfg.baseline_sparsevlm_cluster_ratio,
+            sparsevlm_rank_tolerance=cfg.baseline_sparsevlm_rank_tolerance,
+            sparsevlm_knn_k=cfg.baseline_sparsevlm_knn_k,
+            sparsevlm_min_prune_tokens=cfg.baseline_sparsevlm_min_prune_tokens,
             debug=cfg.baseline_debug,
         ),
     )
@@ -1235,6 +1247,12 @@ def parse_args() -> GenerateConfig:
     parser.add_argument("--baseline_max_pruning_layers", type=int, default=defaults.baseline_max_pruning_layers)
     parser.add_argument("--baseline_layer_indices", type=parse_int_tuple, default=defaults.baseline_layer_indices)
     parser.add_argument("--baseline_visionzip_dominant_ratio", type=float, default=defaults.baseline_visionzip_dominant_ratio)
+    parser.add_argument("--baseline_sparsevlm_lambda", type=float, default=defaults.baseline_sparsevlm_lambda)
+    parser.add_argument("--baseline_sparsevlm_recycle_top_ratio", type=float, default=defaults.baseline_sparsevlm_recycle_top_ratio)
+    parser.add_argument("--baseline_sparsevlm_cluster_ratio", type=float, default=defaults.baseline_sparsevlm_cluster_ratio)
+    parser.add_argument("--baseline_sparsevlm_rank_tolerance", type=float, default=defaults.baseline_sparsevlm_rank_tolerance)
+    parser.add_argument("--baseline_sparsevlm_knn_k", type=int, default=defaults.baseline_sparsevlm_knn_k)
+    parser.add_argument("--baseline_sparsevlm_min_prune_tokens", type=int, default=defaults.baseline_sparsevlm_min_prune_tokens)
     parser.add_argument("--baseline_debug", type=parse_bool, default=defaults.baseline_debug)
     parser.add_argument("--run_id_note", type=str, default=defaults.run_id_note)
     parser.add_argument("--local_log_dir", type=str, default=defaults.local_log_dir)
