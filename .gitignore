@@ -30,20 +30,23 @@ pretrained/
 *.gguf
 
 # Datasets and generated assets
-datasets/
-data/
-modified_libero_rlds/
+/datasets/
+/data/
+**/modified_libero_rlds/
+/methods/fastv/data/
+/methods/fastervlm/playground/data/
+/methods/fastv/src/LLaVA/playground/data/
 *.tfrecord*
 *.hdf5
 *.h5
 
 # Experiment outputs
-logs/
-outputs/
-results/raw/
-wandb/
-runs/
-rollouts/
+**/logs/
+**/outputs/
+/results/raw/
+**/wandb/
+**/runs/
+**/rollouts/
 *.mp4
 *.avi
 *.mov
