@@ -1,0 +1,8 @@
+/mnt/jarvis/Nora_checkpoints
+/mnt/jarvis/nora_runs/libero_goal_dual_448_stage2/steps_10000
+/mnt/jarvis/nora_runs/libero_object_dual_448_stage2/steps_12000
+/mnt/jarvis/nora_runs/libero_goal_dual_256_stage1/steps_4000
+/mnt/jarvis/nora_runs/test_object_dual_256_frontcheck/steps_4000
+/mnt/jarvis/nora_runs/libero_spatial_896_resume_direct_20260323_0948/steps_4750
+/home/jarvis/auto_nora/experiments/logs
+/home/jarvis/auto_nora/overnight_launches

@@ -1,0 +1,53 @@
+# Python and editor artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Environments
+.venv/
+venv/
+env/
+miniconda3/
+*.conda
+
+# Model weights and checkpoints
+checkpoints/
+checkpoint*/
+weights/
+pretrained/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+*.gguf
+
+# Datasets and generated assets
+datasets/
+data/
+modified_libero_rlds/
+*.tfrecord*
+*.hdf5
+*.h5
+
+# Experiment outputs
+logs/
+outputs/
+results/raw/
+wandb/
+runs/
+rollouts/
+*.mp4
+*.avi
+*.mov
+
+# System files
+.DS_Store
+Thumbs.db

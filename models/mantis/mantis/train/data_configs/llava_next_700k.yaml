@@ -1,0 +1,9 @@
+data:
+  - 
+    name: "default"
+    type: huggingface
+    path: lmms-lab/LLaVA-NeXT-Data
+    format: chat
+    split: train
+    vl_only: true
+    max_size: 100000
