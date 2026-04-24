@@ -6,6 +6,22 @@ from typing import Optional, Union, Dict, Any
 from qwen_vl_utils import process_vision_info
 from huggingface_hub import hf_hub_download
 import json
+import sys
+import time
+from pathlib import Path
+
+try:
+    from nora_baseline_pruning import NoraBaselinePruningConfig, maybe_apply_nora_baseline_pruning
+except Exception:
+    _ROOT = Path(__file__).resolve().parents[4]
+    _BASELINE_DIR = _ROOT / "methods" / "auto_prune" / "nora" / "experiments" / "libero"
+    if str(_BASELINE_DIR) not in sys.path:
+        sys.path.insert(0, str(_BASELINE_DIR))
+    try:
+        from nora_baseline_pruning import NoraBaselinePruningConfig, maybe_apply_nora_baseline_pruning
+    except Exception:
+        NoraBaselinePruningConfig = None
+        maybe_apply_nora_baseline_pruning = None
 
 def normalize_gripper_action(action, binarize=True):
     """
@@ -47,7 +63,9 @@ class Nora:
         self,
         model_path: str ="declare-lab/nora",
         device: Optional[str] = None,
-        torch_dtype: torch.dtype = torch.bfloat16 # Make dtype configurable
+        torch_dtype: torch.dtype = torch.bfloat16, # Make dtype configurable
+        baseline_pruning_config: Optional[Any] = None,
+        **kwargs,
     ):
         """
         Initializes the QwenRoboInference model and processors.
@@ -206,6 +224,16 @@ class Nora:
             self.model.generation_config.do_sample = False # Ensure deterministic output
 
             self.model.eval() # Set the model to evaluation mode
+            self.baseline_pruning_patch = None
+            if (
+                baseline_pruning_config is not None
+                and getattr(baseline_pruning_config, "enabled", False)
+                and maybe_apply_nora_baseline_pruning is not None
+            ):
+                self.baseline_pruning_patch = maybe_apply_nora_baseline_pruning(
+                    self.model,
+                    baseline_pruning_config,
+                )
 
             repo_id = "declare-lab/nora"
             filename = "norm_stats.json"
@@ -225,7 +253,7 @@ class Nora:
         print("Model and processors loaded successfully.")
     
     @torch.inference_mode()
-    def inference(self, image: np.ndarray, instruction: str,unnorm_key: str = None,unnormalizer=None) -> np.ndarray:
+    def inference(self, image: np.ndarray, image_wrist_or_instruction=None, instruction: Optional[str] = None, unnorm_key: str = None,unnormalizer=None) -> np.ndarray:
         """
         Performs inference to get robotic actions based on an image and instruction.
 
@@ -238,6 +266,11 @@ class Nora:
         Returns:
             np.ndarray: The predicted unnormalized robotic action array.
         """
+        inference_t0 = time.perf_counter()
+        self.last_inference_profile = None
+        preprocess_t0 = time.perf_counter()
+        if instruction is None:
+            instruction = image_wrist_or_instruction
         # --- Prepare Inputs ---
         # Ensure image is PIL Image for processor compatibility
         if not isinstance(image, PIL.Image.Image):
@@ -278,10 +311,26 @@ class Nora:
 
         # Move inputs to GPU
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        preprocess_seconds = time.perf_counter() - preprocess_t0
 
         # --- Generate Output ---
-        
+        generate_t0 = time.perf_counter()
         generated_ids = self.model.generate(**inputs)
+        generate_seconds = time.perf_counter() - generate_t0
+        patch_stats = {}
+        patch_ref = getattr(self.model, "_nora_baseline_pruning_patch", None) or getattr(self.model, "_autoprune_patch", None)
+        if patch_ref is not None and hasattr(patch_ref, "get_runtime_stats"):
+            patch_stats = patch_ref.get_runtime_stats()
+        self.last_inference_profile = {
+            "inference_total_seconds": time.perf_counter() - inference_t0,
+            "preprocess_seconds": preprocess_seconds,
+            "generate_seconds": generate_seconds,
+            "decode_seconds": 0.0,
+            "vit_seconds": 0.0,
+            "prefill_seconds": 0.0,
+            "decode_model_seconds": 0.0,
+            **patch_stats,
+        }
 
     
 
@@ -310,6 +359,8 @@ class Nora:
         if unnormalizer is not None: ## If a Lerobot Unnormalizer is provided, use it to unnormalize the action
             #
             unnormalized_action = unnormalizer({'action':output_action})
+            if self.last_inference_profile is not None:
+                self.last_inference_profile["inference_total_seconds"] = time.perf_counter() - inference_t0
             return unnormalized_action['action']
        
 
@@ -333,7 +384,8 @@ class Nora:
 
       
 
-        
+        if self.last_inference_profile is not None:
+            self.last_inference_profile["inference_total_seconds"] = time.perf_counter() - inference_t0
         return np.array(unnorm_actions[0])
 
     @staticmethod

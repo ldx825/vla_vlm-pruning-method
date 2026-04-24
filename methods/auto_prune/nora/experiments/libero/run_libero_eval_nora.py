@@ -48,7 +48,25 @@ from libero_utils import get_libero_dummy_action, get_libero_env, get_libero_ima
 from robot_utils import DATE_TIME, get_image_resize_size, invert_gripper_action, normalize_gripper_action, set_seed_everywhere
 from nora_utils import Nora
 from autoprune_nora import NoraAutoPruneConfig
-from compare_pruning_patch_nora import NoraComparePruningConfig
+try:
+    from compare_pruning_patch_nora import NoraComparePruningConfig
+except Exception:
+    @dataclass
+    class NoraComparePruningConfig:
+        enabled: bool = False
+        method: str = "off"
+        visual_tokens: int = 256
+        num_views: int = 2
+        fastv_pruning_layer: int = 2
+        sparsevlm_pruning_start_layer: int = 2
+        sparsevlm_lambda: float = 1.0
+        sparsevlm_recycle_top_ratio: float = 0.5
+        sparsevlm_cluster_ratio: float = 0.25
+        sparsevlm_rank_tolerance: float = 1e-4
+        sparsevlm_knn_k: int = 8
+        detailed_timing: bool = True
+        debug: bool = False
+from nora_baseline_pruning import NoraBaselinePruningConfig
 
 
 # Keep latency accounting identical to OpenVLA eval script: per inference call,
@@ -304,6 +322,19 @@ class GenerateConfig:
     compare_debug: bool = False
 
     #################################################################################################################
+    # Paper baselines (FasterVLM / VisionZip / PyramidDrop)
+    #################################################################################################################
+    enable_baseline_pruning: bool = False
+    baseline_pruning_method: str = "fastervlm"
+    baseline_target_token_num: int = 128
+    baseline_visual_tokens: int = 512
+    baseline_start_layer: int = 2
+    baseline_max_pruning_layers: int = 6
+    baseline_layer_indices: tuple[int, ...] = tuple()
+    baseline_visionzip_dominant_ratio: float = 0.7
+    baseline_debug: bool = False
+
+    #################################################################################################################
     # Utils
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add in run ID for logging
@@ -330,8 +361,9 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
 
     cfg = apply_autoprune_preset(cfg)
-    if cfg.enable_autoprune and cfg.enable_compare_pruning:
-        raise ValueError("AutoPrune and compare pruning baselines cannot be enabled at the same time.")
+    enabled_pruners = int(bool(cfg.enable_autoprune)) + int(bool(cfg.enable_compare_pruning)) + int(bool(cfg.enable_baseline_pruning))
+    if enabled_pruners > 1:
+        raise ValueError("Enable only one pruning path among AutoPrune, compare pruning, and paper baseline pruning.")
     budget_mode = str(getattr(cfg, "autoprune_budget_mode", "absolute") or "absolute").strip().lower()
     budget_semantics = str(getattr(cfg, "autoprune_budget_semantics", "final_cap") or "final_cap").strip().lower()
     using_absolute_area = budget_mode == "absolute" and budget_semantics == "area"
@@ -422,6 +454,17 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
             sparsevlm_knn_k=cfg.compare_sparsevlm_knn_k,
             detailed_timing=cfg.compare_detailed_timing,
             debug=cfg.compare_debug,
+        ),
+        baseline_pruning_config=NoraBaselinePruningConfig(
+            enabled=cfg.enable_baseline_pruning,
+            method=cfg.baseline_pruning_method,
+            target_token_num=cfg.baseline_target_token_num,
+            visual_tokens=cfg.baseline_visual_tokens,
+            start_layer=cfg.baseline_start_layer,
+            max_pruning_layers=cfg.baseline_max_pruning_layers,
+            layer_indices=cfg.baseline_layer_indices,
+            visionzip_dominant_ratio=cfg.baseline_visionzip_dominant_ratio,
+            debug=cfg.baseline_debug,
         ),
     )
     model.fast_tokenizer.time_horizon = cfg.action_horizon
@@ -1184,6 +1227,15 @@ def parse_args() -> GenerateConfig:
     parser.add_argument("--compare_sparsevlm_knn_k", type=int, default=defaults.compare_sparsevlm_knn_k)
     parser.add_argument("--compare_detailed_timing", type=parse_bool, default=defaults.compare_detailed_timing)
     parser.add_argument("--compare_debug", type=parse_bool, default=defaults.compare_debug)
+    parser.add_argument("--enable_baseline_pruning", type=parse_bool, default=defaults.enable_baseline_pruning)
+    parser.add_argument("--baseline_pruning_method", type=str, default=defaults.baseline_pruning_method)
+    parser.add_argument("--baseline_target_token_num", type=int, default=defaults.baseline_target_token_num)
+    parser.add_argument("--baseline_visual_tokens", type=int, default=defaults.baseline_visual_tokens)
+    parser.add_argument("--baseline_start_layer", type=int, default=defaults.baseline_start_layer)
+    parser.add_argument("--baseline_max_pruning_layers", type=int, default=defaults.baseline_max_pruning_layers)
+    parser.add_argument("--baseline_layer_indices", type=parse_int_tuple, default=defaults.baseline_layer_indices)
+    parser.add_argument("--baseline_visionzip_dominant_ratio", type=float, default=defaults.baseline_visionzip_dominant_ratio)
+    parser.add_argument("--baseline_debug", type=parse_bool, default=defaults.baseline_debug)
     parser.add_argument("--run_id_note", type=str, default=defaults.run_id_note)
     parser.add_argument("--local_log_dir", type=str, default=defaults.local_log_dir)
     parser.add_argument("--latency_csv_filename", type=str, default=defaults.latency_csv_filename)
