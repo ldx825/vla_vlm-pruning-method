@@ -21,9 +21,17 @@ import tqdm
 from libero.libero import benchmark
 ##autoprune
 sys.path.append(os.getcwd())
-from autoprune_patch_improved import AutoPrunePatchImproved as AutoPrunePatchModern
+try:
+    from autoprune_patch_improved import AutoPrunePatchImproved as AutoPrunePatchModern
+except Exception:
+    AutoPrunePatchModern = None
 from autoprune_patch_improved_1 import AutoPrunePatchImproved as AutoPrunePatchLegacy
-from compare_pruning_patch import ComparePruningConfig, ComparePruningPatch
+try:
+    from compare_pruning_patch import ComparePruningConfig, ComparePruningPatch
+except Exception:
+    ComparePruningConfig = None
+    ComparePruningPatch = None
+from fastv_patch import FastVConfig, maybe_apply_fastv_patch
 import wandb
 import time
 
@@ -166,6 +174,15 @@ class GenerateConfig:
     compare_patch_scope: str = "full"                # full / vision_only / regression_only / passthrough
 
     #################################################################################################################
+    # FastV baseline (Chen et al. 2024)
+    #################################################################################################################
+    use_fastv_pruning: bool = False                  # Whether to enable standalone FastV pruning
+    fastv_keep_visual_tokens: int = 128              # Final kept visual tokens; R is derived internally
+    fastv_visual_tokens: int = 512                   # Unified visual token pool across all views
+    fastv_pruning_layer: int = 2                     # K in FastV, 1-based: prune after this layer
+    fastv_debug: bool = False                        # Extra debug prints from the patch
+
+    #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite
@@ -218,6 +235,10 @@ def validate_config(cfg: GenerateConfig) -> None:
             assert cfg.compare_sparsevlm_recycle_top_ratio >= 0.0, "compare_sparsevlm_recycle_top_ratio must be non-negative!"
             assert cfg.compare_sparsevlm_cluster_ratio >= 0.0, "compare_sparsevlm_cluster_ratio must be non-negative!"
             assert cfg.compare_sparsevlm_knn_k > 0, "compare_sparsevlm_knn_k must be positive!"
+    if cfg.use_fastv_pruning:
+        assert cfg.fastv_keep_visual_tokens > 0, "fastv_keep_visual_tokens must be positive!"
+        assert cfg.fastv_visual_tokens > 0, "fastv_visual_tokens must be positive!"
+        assert cfg.fastv_pruning_layer > 0, "fastv_pruning_layer K must be positive!"
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -448,6 +469,8 @@ def run_episode(
                 patch_ref = getattr(model, "_autoprune_patch_ref", None)
                 if patch_ref is None:
                     patch_ref = getattr(model, "_compare_patch_ref", None)
+                if patch_ref is None:
+                    patch_ref = getattr(model, "_fastv_patch_ref", None)
                 if patch_ref is not None:
                     stats = dict(getattr(patch_ref, "latest_stats", {}) or {})
                     keep_count_schedule = stats.get("keep_count_schedule") or []
@@ -668,9 +691,11 @@ def eval_libero(cfg: GenerateConfig) -> float:
     # ===============================================================================
     ENABLE_AUTOPRUNE = cfg.use_auto_prune
     ENABLE_COMPARE_PRUNING = cfg.use_compare_pruning
+    ENABLE_FASTV_PRUNING = cfg.use_fastv_pruning
 
-    if ENABLE_AUTOPRUNE and ENABLE_COMPARE_PRUNING:
-        raise ValueError("Please enable either AutoPrune or compare pruning baselines, not both.")
+    enabled_pruners = int(bool(ENABLE_AUTOPRUNE)) + int(bool(ENABLE_COMPARE_PRUNING)) + int(bool(ENABLE_FASTV_PRUNING))
+    if enabled_pruners > 1:
+        raise ValueError("Please enable only one of AutoPrune, compare pruning baselines, or standalone FastV.")
 
     if ENABLE_AUTOPRUNE:
         print("\n" + "="*40)
@@ -709,6 +734,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
             
             try:
                 patch_cls = AutoPrunePatchLegacy if cfg.autoprune_patch_variant == "legacy_budget" else AutoPrunePatchModern
+                if patch_cls is None:
+                    raise RuntimeError("Requested modern AutoPrune patch, but autoprune_patch_improved.py was not found.")
                 patcher = patch_cls(
                     model=model,    # 传入顶层 OpenVLA 模型，内部再定位并 patch Llama 层与动作预测入口
                     target_token_num=cfg.target_token_num,
@@ -746,6 +773,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
         print(f"🧪 Activating compare pruning baseline: {cfg.compare_pruning_method}")
         print("="*40 + "\n")
         try:
+            if ComparePruningConfig is None or ComparePruningPatch is None:
+                raise RuntimeError("compare_pruning_patch.py was not found in this OpenVLA-OFT method directory.")
             compare_cfg = ComparePruningConfig(
                 method=cfg.compare_pruning_method,
                 visual_token_num=cfg.compare_visual_token_num,
@@ -770,6 +799,30 @@ def eval_libero(cfg: GenerateConfig) -> float:
             print("✅ Compare pruning baseline successfully patched!")
         except Exception as e:
             print(f"❌ Failed to apply compare pruning baseline: {e}")
+            import traceback
+            traceback.print_exc()
+
+    if ENABLE_FASTV_PRUNING:
+        print("\n" + "="*40)
+        print("⚡ Activating FastV baseline (standalone unified visual pool)...")
+        print("="*40 + "\n")
+        try:
+            fastv_cfg = FastVConfig(
+                enabled=True,
+                keep_visual_tokens=cfg.fastv_keep_visual_tokens,
+                visual_tokens=cfg.fastv_visual_tokens,
+                pruning_layer=cfg.fastv_pruning_layer,
+                debug=cfg.fastv_debug,
+            )
+            fastv_patcher = maybe_apply_fastv_patch(model=model, config=fastv_cfg)
+            setattr(model, "_fastv_patch_ref", fastv_patcher)
+            # Reuse the existing stats collection path in rollout(); it first
+            # checks AutoPrune/compare refs, so expose FastV through the same
+            # shape while keeping the dedicated ref for clarity.
+            setattr(model, "_compare_patch_ref", fastv_patcher)
+            print("✅ FastV successfully patched!")
+        except Exception as e:
+            print(f"❌ Failed to apply FastV: {e}")
             import traceback
             traceback.print_exc()
             
