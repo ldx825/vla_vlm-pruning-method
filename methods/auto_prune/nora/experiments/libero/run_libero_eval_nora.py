@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import csv
+import traceback
 import gc
 import json
 import os
@@ -845,6 +846,9 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
                 except Exception as e:
                     print(f"Caught exception: {e}")
                     log_file.write(f"Caught exception: {e}\n")
+                    tb = traceback.format_exc()
+                    print(tb)
+                    log_file.write(tb + "\n")
                     break
 
             task_episodes += 1

@@ -87,6 +87,12 @@ class AdaptiveBudgetStrategy:
         return self.b_min + (self.b_max - self.b_min) * torch.sigmoid(value)
 
 
+def _estimate_flops_reduction(prefill_len: int, before_visual: int, after_visual: int) -> float:
+    dense = max(1.0, float(prefill_len) ** 2)
+    pruned_len = max(1.0, float(prefill_len - max(0, before_visual - after_visual)))
+    return max(0.0, min(1.0, 1.0 - (pruned_len * pruned_len) / dense))
+
+
 def _finite_scalar(
     value: torch.Tensor,
     *,
@@ -491,6 +497,10 @@ class NoraAutoPrunePatch:
             "layout_query_tokens": 0,
             "layout_view0_tokens": 0,
             "layout_view1_tokens": 0,
+            "flops_reduction": 0.0,
+            "final_visual_tokens": 0.0,
+            "raw_total_budget": 0.0,
+            "active_pruning_layers": float(len(self.pruning_loc)),
             "manual_attention_probe_layers": 0,
             "manual_probe_qk_cache_hits": 0,
             "manual_probe_qk_cache_misses": 0,
@@ -551,6 +561,7 @@ class NoraAutoPrunePatch:
             self.original_forwards[i] = layer.forward
             layer.forward = types.MethodType(self._make_new_forward(i), layer)
             self._register_projection_hooks(i, layer)
+        self.model._autoprune_patch = self
 
     def _register_projection_hooks(self, layer_idx: int, layer: Any) -> None:
         self_attn = getattr(layer, "self_attn", None)
@@ -1682,6 +1693,8 @@ class NoraAutoPrunePatch:
                     self.runtime_stats["total_budget"] = float(current_vis_len)
                     self.runtime_stats["last_tokens_before"] = int(current_vis_len)
                     self.runtime_stats["last_tokens_after"] = int(current_vis_len)
+                    self.runtime_stats["final_visual_tokens"] = float(current_vis_len)
+                    self.runtime_stats["flops_reduction"] = 0.0
                     if self.config.debug:
                         print("[AutoPruneDebug] no-prune budget detected before score collection")
                     outputs = self._run_profiled_original_forward(
@@ -1821,6 +1834,8 @@ class NoraAutoPrunePatch:
                     self.runtime_stats["total_budget"] = float(current_vis_len)
                     self.runtime_stats["last_tokens_before"] = int(current_vis_len)
                     self.runtime_stats["last_tokens_after"] = int(current_vis_len)
+                    self.runtime_stats["final_visual_tokens"] = float(current_vis_len)
+                    self.runtime_stats["flops_reduction"] = 0.0
                     if self.config.debug:
                         print("[AutoPruneDebug] no-prune budget detected, bypass progressive path")
                     return finish(clean_outputs(outputs))
@@ -2197,6 +2212,8 @@ class NoraAutoPrunePatch:
             if k_h >= c_h and k_w >= c_w:
                 self.runtime_stats["last_tokens_before"] = int(curr_vis_len)
                 self.runtime_stats["last_tokens_after"] = int(curr_vis_len)
+                self.runtime_stats["final_visual_tokens"] = float(curr_vis_len)
+                self.runtime_stats["flops_reduction"] = 0.0
                 return finish(clean_outputs(outputs))
 
             target_total = int(k_h + k_w)
@@ -2209,6 +2226,12 @@ class NoraAutoPrunePatch:
             ):
                 self.runtime_stats["last_tokens_before"] = int(curr_vis_len)
                 self.runtime_stats["last_tokens_after"] = int(curr_vis_len)
+                self.runtime_stats["final_visual_tokens"] = float(curr_vis_len)
+                self.runtime_stats["flops_reduction"] = _estimate_flops_reduction(
+                    seq_len,
+                    curr_vis_len,
+                    curr_vis_len,
+                )
                 self.runtime_stats["compaction_skipped_layers"] = int(
                     self.runtime_stats.get("compaction_skipped_layers", 0) + 1
                 )
@@ -2262,8 +2285,35 @@ class NoraAutoPrunePatch:
             self.view_boundary_tracker["current_h"] = k_h
             self.view_boundary_tracker["current_w"] = k_w
             self.runtime_stats["pruned_layers"] = int(self.runtime_stats.get("pruned_layers", 0) + 1)
+            self.runtime_stats["final_visual_tokens"] = float(target_total)
+            self.runtime_stats["flops_reduction"] = _estimate_flops_reduction(
+                seq_len,
+                curr_vis_len,
+                target_total,
+            )
 
             # Preserve original return signature (with/without attentions) after replacing hidden_states.
             return finish(clean_outputs((pruned_hidden,) + outputs[1:]))
 
         return new_forward
+
+    def get_runtime_stats(self) -> Dict[str, Any]:
+        return dict(self.runtime_stats)
+
+    def get_flops_reduction(self) -> float:
+        return float(self.runtime_stats.get("flops_reduction", 0.0) or 0.0)
+
+
+def maybe_apply_nora_autoprune(model, config: Optional[NoraAutoPruneConfig]) -> Optional[NoraAutoPrunePatch]:
+    if config is None or not getattr(config, "enabled", False):
+        return None
+    patch = NoraAutoPrunePatch(model, config)
+    patch.apply()
+    return patch
+
+
+__all__ = [
+    "NoraAutoPruneConfig",
+    "NoraAutoPrunePatch",
+    "maybe_apply_nora_autoprune",
+]

@@ -6,6 +6,7 @@ from typing import Optional, Union, Dict, Any
 from qwen_vl_utils import process_vision_info
 from huggingface_hub import hf_hub_download
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -22,6 +23,19 @@ except Exception:
     except Exception:
         NoraBaselinePruningConfig = None
         maybe_apply_nora_baseline_pruning = None
+
+try:
+    from autoprune_nora import NoraAutoPruneConfig, maybe_apply_nora_autoprune
+except Exception:
+    _ROOT = Path(__file__).resolve().parents[4]
+    _AUTOPRUNE_DIR = _ROOT / "methods" / "auto_prune" / "nora" / "experiments" / "libero"
+    if str(_AUTOPRUNE_DIR) not in sys.path:
+        sys.path.insert(0, str(_AUTOPRUNE_DIR))
+    try:
+        from autoprune_nora import NoraAutoPruneConfig, maybe_apply_nora_autoprune
+    except Exception:
+        NoraAutoPruneConfig = None
+        maybe_apply_nora_autoprune = None
 
 def normalize_gripper_action(action, binarize=True):
     """
@@ -57,6 +71,7 @@ class Nora:
     # These are specific to the model's vocabulary and task
     _ACTION_TOKEN_MIN = 151665
     _ACTION_TOKEN_MAX = 153712
+    _ACTION_TOKEN_RE = re.compile(r"<robot_action_(\d+)>")
 
 
     def __init__(
@@ -64,6 +79,7 @@ class Nora:
         model_path: str ="declare-lab/nora",
         device: Optional[str] = None,
         torch_dtype: torch.dtype = torch.bfloat16, # Make dtype configurable
+        autoprune_config: Optional[Any] = None,
         baseline_pruning_config: Optional[Any] = None,
         **kwargs,
     ):
@@ -80,6 +96,13 @@ class Nora:
         Raises:
             RuntimeError: If models or processors fail to load, or device is unavailable.
         """
+        image_resize_size = kwargs.get("image_resize_size", (224, 224))
+        if isinstance(image_resize_size, int):
+            image_resize_size = (int(image_resize_size), int(image_resize_size))
+        self.image_resize_size = tuple(int(v) for v in image_resize_size)
+        self.dual_view_mode = str(kwargs.get("dual_view_mode", "separate"))
+        self.use_anyres = bool(kwargs.get("use_anyres", False))
+
         # --- Device Setup ---
         self.libero_keys= {'libero_object':[np.array( [
         -0.5383928418159485,
@@ -279,6 +302,16 @@ class Nora:
             self.model.generation_config.do_sample = False # Ensure deterministic output
 
             self.model.eval() # Set the model to evaluation mode
+            self.autoprune_patch = None
+            if (
+                autoprune_config is not None
+                and getattr(autoprune_config, "enabled", False)
+                and maybe_apply_nora_autoprune is not None
+            ):
+                self.autoprune_patch = maybe_apply_nora_autoprune(
+                    self.model,
+                    autoprune_config,
+                )
             self.baseline_pruning_patch = None
             if (
                 baseline_pruning_config is not None
@@ -306,6 +339,52 @@ class Nora:
             raise RuntimeError(f"Error loading model from {model_path}: {e}")
 
         print("Model and processors loaded successfully.")
+
+    def _extract_fast_action_token_ids(self, generated_ids: torch.Tensor, prompt_len: int = 0) -> list[int]:
+        seq = generated_ids[0]
+        if prompt_len > 0 and prompt_len < int(seq.shape[0]):
+            seq = seq[prompt_len:]
+
+        # Nora training serializes one action chunk as a contiguous span of
+        # <robot_action_x> special tokens in the assistant response. For
+        # extraction we therefore only keep the first contiguous action span in
+        # the generated continuation instead of collecting every matching token
+        # from the whole sequence.
+        action_mask = (self._ACTION_TOKEN_MIN <= seq) & (seq <= self._ACTION_TOKEN_MAX)
+        action_positions = torch.where(action_mask)[0]
+        if action_positions.numel() <= 0:
+            return []
+
+        start = int(action_positions[0].item())
+        end = start
+        seq_len = int(seq.shape[0])
+        while end < seq_len and int(self._ACTION_TOKEN_MIN) <= int(seq[end].item()) <= int(self._ACTION_TOKEN_MAX):
+            end += 1
+
+        action_span = seq[start:end]
+        if action_span.numel() <= 0:
+            return []
+        return (action_span - self._ACTION_TOKEN_MIN).detach().cpu().tolist()
+
+    def _decode_fast_action_tokens(self, fast_action_token_ids: list[int]) -> np.ndarray:
+        action_dim = int(getattr(self.fast_tokenizer, "action_dim", 7))
+        target_horizon = int(getattr(self.fast_tokenizer, "time_horizon", 1))
+        fallback = np.zeros((1, target_horizon, action_dim), dtype=np.float32)
+        if not fast_action_token_ids:
+            return fallback
+        try:
+            decoded_action = self.fast_tokenizer.decode(
+                [fast_action_token_ids],
+                time_horizon=target_horizon,
+                action_dim=action_dim,
+            )
+        except Exception as exc:
+            print(f"Error decoding action tokens with fast tokenizer: {exc}")
+            print(f"Tokens: {fast_action_token_ids}")
+            return fallback
+        if not isinstance(decoded_action, np.ndarray):
+            decoded_action = np.array(decoded_action, dtype=np.float32)
+        return decoded_action.astype(np.float32, copy=False)
     
     @torch.inference_mode()
     def inference(self, image: np.ndarray, image_wrist_or_instruction=None, instruction: Optional[str] = None, unnorm_key: str = None,unnormalizer=None) -> np.ndarray:
@@ -331,19 +410,42 @@ class Nora:
         if not isinstance(image, PIL.Image.Image):
              image = PIL.Image.fromarray(image)
 
-        # Construct messages in the expected chat format. Note that nora expects image of size 224 by 224
+        resize_h, resize_w = self.image_resize_size
+        content = [
+            {
+                "type": "image",
+                "image": image,
+                "resized_height": resize_h,
+                "resized_width": resize_w,
+            }
+        ]
+        image_wrist = image_wrist_or_instruction if instruction is not None else None
+        if image_wrist is not None:
+            if not isinstance(image_wrist, PIL.Image.Image):
+                image_wrist = PIL.Image.fromarray(image_wrist)
+            if self.dual_view_mode == "stitched":
+                stitched = PIL.Image.new("RGB", (image.width + image_wrist.width, max(image.height, image_wrist.height)))
+                stitched.paste(image.convert("RGB"), (0, 0))
+                stitched.paste(image_wrist.convert("RGB"), (image.width, 0))
+                content[0]["image"] = stitched
+                content[0]["resized_width"] = resize_w * 2
+            else:
+                content.append(
+                    {
+                        "type": "image",
+                        "image": image_wrist,
+                        "resized_height": resize_h,
+                        "resized_width": resize_w,
+                    }
+                )
+
+        content.append({"type": "text", "text": instruction})
+
+        # Construct messages in the expected chat format.
         messages = [
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "image": image,
-                        "resized_height": 224,
-                        "resized_width": 224,
-                    },
-                    {"type": "text", "text": instruction},
-                ],
+                "content": content,
             }
         ]
 
@@ -393,23 +495,16 @@ class Nora:
         # Find the indices of tokens within the action token range
        
         
-        start_idx = (self._ACTION_TOKEN_MIN <= generated_ids[0]) & (generated_ids[0] <= self._ACTION_TOKEN_MAX)
-        start_idx = torch.where(start_idx)[0]
-
-        if len(start_idx) > 0:
-            start_index = start_idx[0].item()
-        else:
-            start_index = None  # or -1 to indicate not found
-
-
-        # Extract the first action token ID
-
-        # Decode the action token using the fast tokenizer
-        # The token ID needs to be map back to the range expected by the fast tokenizer decoder
-
-        
-       
-        output_action = self.fast_tokenizer.decode([generated_ids[0][start_idx] - self._ACTION_TOKEN_MIN])
+        prompt_len = int(inputs["input_ids"].shape[1]) if "input_ids" in inputs else 0
+        fast_action_token_ids = self._extract_fast_action_token_ids(generated_ids, prompt_len=prompt_len)
+        if self.last_inference_profile is not None:
+            self.last_inference_profile["generated_token_count"] = float(generated_ids.shape[-1])
+            self.last_inference_profile["prompt_token_count"] = float(prompt_len)
+            self.last_inference_profile["action_token_count"] = float(len(fast_action_token_ids))
+            self.last_inference_profile["expected_coeff_count"] = float(
+                int(getattr(self.fast_tokenizer, "time_horizon", 1)) * int(getattr(self.fast_tokenizer, "action_dim", 7))
+            )
+        output_action = self._decode_fast_action_tokens(fast_action_token_ids)
         
         if unnormalizer is not None: ## If a Lerobot Unnormalizer is provided, use it to unnormalize the action
             #

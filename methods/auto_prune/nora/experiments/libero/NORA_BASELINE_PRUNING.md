@@ -24,7 +24,7 @@ Methods:
 
 - FasterVLM compresses visual tokens before LLM prefill. The requested final keep count is converted internally to the paper's reduction ratio `R = 1 - keep / total`.
 - VisionZip compresses before LLM prefill. `K` and `M` are split as 70% dominant tokens and 30% contextual tokens.
-- PyramidDrop prunes during prefill at decoder stage boundaries. It solves `lambda` so the average remaining visual tokens across pruning stages matches `baseline_target_token_num`.
+- PyramidDrop prunes only during LLM prefill at decoder stage boundaries. It solves `lambda` so the mean number of remaining visual tokens across pruning stages is `baseline_target_token_num`, then applies the paper's exponential staged ratio schedule; decode/action-token generation is not pruned.
 - FastV runs the first `baseline_start_layer` layers normally, then prunes after layer K. The score is attention from all non-visual tokens to visual tokens, including NORA action tokens.
 - SparseVLM starts at `baseline_start_layer` and prunes progressively in decoder layers. Text raters are selected only from non-action instruction/text tokens, then visual tokens are scored, adaptively deleted with rank/redundancy, partially rescued, clustered, and merged.
 

@@ -6,10 +6,11 @@ PYTHON_BIN="/home/liudongxu/.local/share/uv/python/cpython-3.10.20-linux-x86_64-
 
 GPU="${GPU:-0}"
 PORT="${PORT:-5678}"
-SUITE="${SUITE:-libero_object}"
+SUITE="${SUITE:-libero_spatial}"
 KEEP="${KEEP:-224}"
 TRIALS="${TRIALS:-3}"
 NUM_TASKS_TO_RUN="${NUM_TASKS_TO_RUN:-1}"
+BASELINE_DEBUG="${BASELINE_DEBUG:-true}"
 RUN_TAG="${RUN_TAG:-debug_pyramiddrop_nora_${SUITE}_keep${KEEP}_trials${TRIALS}}"
 
 cd "$ROOT_DIR"
@@ -35,14 +36,25 @@ case "$SUITE" in
 esac
 
 RESULT_ROOT="$ROOT_DIR/results/nora/libero/$RUN_TAG"
-mkdir -p "$RESULT_ROOT/eval_logs" "$RESULT_ROOT/matplotlib"
+LIBERO_BENCHMARK_ROOT="$ROOT_DIR/ldx/LIBERO/libero/libero"
+LIBERO_CONFIG_DIR="$RESULT_ROOT/libero_config"
+mkdir -p "$RESULT_ROOT/eval_logs" "$RESULT_ROOT/matplotlib" "$LIBERO_CONFIG_DIR"
+
+cat > "$LIBERO_CONFIG_DIR/config.yaml" <<EOF
+benchmark_root: $LIBERO_BENCHMARK_ROOT
+bddl_files: $LIBERO_BENCHMARK_ROOT/bddl_files
+init_states: $LIBERO_BENCHMARK_ROOT/init_files
+datasets: $ROOT_DIR/ldx/LIBERO/libero/datasets
+EOF
 
 export HOME="/home/liudongxu"
+export LIBERO_CONFIG_PATH="$LIBERO_CONFIG_DIR"
 export HF_HOME="${HF_HOME:-/mnt/jarvis/.hf}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-/mnt/jarvis/.hf/hub}"
 export MPLCONFIGDIR="$RESULT_ROOT/matplotlib"
 export WANDB_MODE=disabled
 export TOKENIZERS_PARALLELISM=false
+export PYOPENGL_PLATFORM=egl
 export CUDA_VISIBLE_DEVICES="$GPU"
 export MUJOCO_EGL_DEVICE_ID="$GPU"
 export PYTHONPATH="/tmp/nora_transformers_nodeps:$ROOT_DIR/Mantis/.venv/lib/python3.10/site-packages:/tmp/nora_eval_deps:$ROOT_DIR/methods/auto_prune/nora/experiments/libero:$ROOT_DIR/models/nora/experiments/libero:$ROOT_DIR/ldx/LIBERO:${PYTHONPATH:-}"
@@ -67,6 +79,7 @@ export PYTHONPATH="/tmp/nora_transformers_nodeps:$ROOT_DIR/Mantis/.venv/lib/pyth
   --baseline_visual_tokens 512 \
   --baseline_start_layer 2 \
   --baseline_max_pruning_layers 6 \
+  --baseline_debug "$BASELINE_DEBUG" \
   --run_id_note "$RUN_TAG" \
   --local_log_dir "$RESULT_ROOT/eval_logs" \
   --latency_csv_filename "${RUN_TAG}_latency.csv" \
