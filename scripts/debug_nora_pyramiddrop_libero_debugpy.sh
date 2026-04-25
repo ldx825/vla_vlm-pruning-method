@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="/home/liudongxu/vla_vlm-pruning-method"
+PYTHON_BIN="/home/liudongxu/.local/share/uv/python/cpython-3.10.20-linux-x86_64-gnu/bin/python3.10"
+
+GPU="${GPU:-0}"
+PORT="${PORT:-5678}"
+SUITE="${SUITE:-libero_object}"
+KEEP="${KEEP:-224}"
+TRIALS="${TRIALS:-3}"
+NUM_TASKS_TO_RUN="${NUM_TASKS_TO_RUN:-1}"
+RUN_TAG="${RUN_TAG:-debug_pyramiddrop_nora_${SUITE}_keep${KEEP}_trials${TRIALS}}"
+
+cd "$ROOT_DIR"
+
+case "$SUITE" in
+  libero_object)
+    MODEL_PATH="${MODEL_PATH:-/tmp/nora_local_models_20260425/object}"
+    FULL_MODEL_STATE_PATH="${FULL_MODEL_STATE_PATH:-/mnt/jarvis/nora_runs/libero_object_dual_448_stage2/steps_12000/steps_12000/model.safetensors}"
+    LORA_ADAPTER_PATH="${LORA_ADAPTER_PATH:-/mnt/jarvis/nora_runs/libero_object_dual_448_stage2/steps_12000/steps_12000/adapter}"
+    ;;
+  libero_goal)
+    MODEL_PATH="${MODEL_PATH:-/tmp/nora_local_models_20260425/goal}"
+    FULL_MODEL_STATE_PATH="${FULL_MODEL_STATE_PATH:-/mnt/jarvis/nora_runs/libero_goal_dual_448_stage2/steps_10000/steps_10000/model.safetensors}"
+    LORA_ADAPTER_PATH="${LORA_ADAPTER_PATH:-/mnt/jarvis/nora_runs/libero_goal_dual_448_stage2/steps_10000/steps_10000/adapter}"
+    ;;
+  libero_spatial)
+    MODEL_PATH="${MODEL_PATH:-/tmp/nora_local_models_20260425/spatial}"
+    FULL_MODEL_STATE_PATH="${FULL_MODEL_STATE_PATH:-/mnt/jarvis/nora_runs/libero_spatial_896_resume_direct_20260323_0948/steps_4750/steps_4750/model.safetensors}"
+    LORA_ADAPTER_PATH="${LORA_ADAPTER_PATH:-/mnt/jarvis/nora_runs/libero_spatial_896_resume_direct_20260323_0948/steps_4750/steps_4750/adapter}"
+    ;;
+  libero_10) MODEL_PATH="${MODEL_PATH:-declare-lab/nora-long-finetuned-libero-10}" ;;
+  *) echo "Unknown SUITE=$SUITE" >&2; exit 1 ;;
+esac
+
+RESULT_ROOT="$ROOT_DIR/results/nora/libero/$RUN_TAG"
+mkdir -p "$RESULT_ROOT/eval_logs" "$RESULT_ROOT/matplotlib"
+
+export HOME="/home/liudongxu"
+export HF_HOME="${HF_HOME:-/mnt/jarvis/.hf}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-/mnt/jarvis/.hf/hub}"
+export MPLCONFIGDIR="$RESULT_ROOT/matplotlib"
+export WANDB_MODE=disabled
+export TOKENIZERS_PARALLELISM=false
+export CUDA_VISIBLE_DEVICES="$GPU"
+export MUJOCO_EGL_DEVICE_ID="$GPU"
+export PYTHONPATH="/tmp/nora_transformers_nodeps:$ROOT_DIR/Mantis/.venv/lib/python3.10/site-packages:/tmp/nora_eval_deps:$ROOT_DIR/methods/auto_prune/nora/experiments/libero:$ROOT_DIR/models/nora/experiments/libero:$ROOT_DIR/ldx/LIBERO:${PYTHONPATH:-}"
+
+"$PYTHON_BIN" -m debugpy --listen "0.0.0.0:$PORT" --wait-for-client \
+  methods/auto_prune/nora/experiments/libero/run_libero_eval_nora.py \
+  --model_family nora \
+  --model_path "$MODEL_PATH" \
+  ${FULL_MODEL_STATE_PATH:+--full_model_state_path "$FULL_MODEL_STATE_PATH"} \
+  ${LORA_ADAPTER_PATH:+--lora_adapter_path "$LORA_ADAPTER_PATH"} \
+  --task_suite_name "$SUITE" \
+  --num_trials_per_task "$TRIALS" \
+  --num_tasks_to_run "$NUM_TASKS_TO_RUN" \
+  --image_resize_resolution 448,448 \
+  --env_camera_resolution 448 \
+  --use_wrist_image true \
+  --dual_view_mode separate \
+  --action_horizon 5 \
+  --enable_baseline_pruning true \
+  --baseline_pruning_method pyramiddrop \
+  --baseline_target_token_num "$KEEP" \
+  --baseline_visual_tokens 512 \
+  --baseline_start_layer 2 \
+  --baseline_max_pruning_layers 6 \
+  --run_id_note "$RUN_TAG" \
+  --local_log_dir "$RESULT_ROOT/eval_logs" \
+  --latency_csv_filename "${RUN_TAG}_latency.csv" \
+  --use_wandb false \
+  --seed 7

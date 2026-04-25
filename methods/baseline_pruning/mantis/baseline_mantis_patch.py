@@ -138,8 +138,10 @@ class MantisBaselinePrunePatch:
                 "method_overhead_seconds": 0.0,
                 "pre_projector": int(self.method in {"fastervlm", "visionzip"}),
                 "pre_llm_prefill": 1,
-                "unified_visual_pruning": 1,
+                "unified_visual_pruning": int(str(self.config.fastv_visual_pool) != "per_view"),
                 "fastv_pruning_layer": int(self.config.fastv_pruning_layer),
+                "fastv_query_mode": str(self.config.fastv_query_mode),
+                "fastv_visual_pool": str(self.config.fastv_visual_pool),
                 "pyramiddrop_lambda": None,
                 "pyramiddrop_layer_indices": [int(idx) for idx in self.pruning_layers] if self.method == "pyramiddrop" else [],
                 "sparsevlm_layer_indices": [int(idx) for idx in self.pruning_layers] if self.method == "sparsevlm" else [],
@@ -254,11 +256,15 @@ class MantisBaselinePrunePatch:
             outputs = self.original_merge(image_features, inputs_embeds, input_ids, attention_mask, labels)
             try:
                 visual_tokens = int(image_features.shape[1])
+                query_token_limit = None
+                if self.method == "fastv" and str(self.config.fastv_query_mode) == "layout_text_no_choice":
+                    query_token_limit = getattr(model_self, "_baseline_prune_choice_prefix_len", None)
                 self.input_layout = prepare_input_layout_from_merge(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     image_token_index=int(model_self.config.image_token_index),
                     visual_tokens_per_view=visual_tokens,
+                    query_token_limit=query_token_limit,
                 )
                 self.runtime_stats.update(summarize_layout(self.input_layout))
                 if isinstance(outputs, tuple) and outputs and isinstance(outputs[0], torch.Tensor):
@@ -384,6 +390,78 @@ class MantisBaselinePrunePatch:
             return (new_hidden, outputs[2])
         return (new_hidden,)
 
+    @staticmethod
+    def _allocate_keep_per_view(view_positions, total_keep: int):
+        lengths = [int(view.numel()) for view in view_positions]
+        total = sum(lengths)
+        if total <= 0:
+            return []
+        keep_total = max(1, min(int(total_keep), total))
+        raw = [keep_total * length / total for length in lengths]
+        counts = [
+            min(length, max(1 if length > 0 else 0, int(math.floor(value))))
+            for length, value in zip(lengths, raw)
+        ]
+        diff = keep_total - sum(counts)
+        order = sorted(
+            range(len(lengths)),
+            key=lambda idx: (raw[idx] - math.floor(raw[idx]), lengths[idx]),
+            reverse=True,
+        )
+        while diff > 0 and order:
+            changed = False
+            for idx in order:
+                if counts[idx] < lengths[idx]:
+                    counts[idx] += 1
+                    diff -= 1
+                    changed = True
+                    if diff == 0:
+                        break
+            if not changed:
+                break
+        while diff < 0:
+            candidates = [idx for idx, count in enumerate(counts) if count > (1 if lengths[idx] > 0 else 0)]
+            if not candidates:
+                break
+            idx = max(candidates, key=lambda item: counts[item])
+            counts[idx] -= 1
+            diff += 1
+        return counts
+
+    @staticmethod
+    def _gather_cache_tensor(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        if tensor is None or tensor.dim() < 3:
+            return tensor
+        gather_idx = indices.to(device=tensor.device, dtype=torch.long)
+        if gather_idx.shape[0] == 1 and tensor.shape[0] > 1:
+            gather_idx = gather_idx.expand(tensor.shape[0], -1)
+        view_shape = [gather_idx.shape[0]] + [1] * max(0, tensor.dim() - 3) + [gather_idx.shape[1]] + [1]
+        gather_idx = gather_idx.view(*view_shape)
+        expand_shape = list(tensor.shape)
+        expand_shape[-2] = indices.shape[1]
+        gather_idx = gather_idx.expand(*expand_shape)
+        return tensor.gather(-2, gather_idx).contiguous()
+
+    def _prune_dynamic_cache(self, cache_obj: Any, full_indices: torch.Tensor) -> None:
+        key_cache = getattr(cache_obj, "key_cache", None)
+        value_cache = getattr(cache_obj, "value_cache", None)
+        if not isinstance(key_cache, list) or not isinstance(value_cache, list):
+            return
+        for cache_idx in range(min(len(key_cache), len(value_cache))):
+            key = key_cache[cache_idx]
+            value = value_cache[cache_idx]
+            if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+                continue
+            if key.shape[-2] != full_indices.shape[1] and key.shape[-2] >= int(full_indices.max().item()) + 1:
+                key_cache[cache_idx] = self._gather_cache_tensor(key, full_indices)
+            if value.shape[-2] != full_indices.shape[1] and value.shape[-2] >= int(full_indices.max().item()) + 1:
+                value_cache[cache_idx] = self._gather_cache_tensor(value, full_indices)
+        if hasattr(cache_obj, "_seen_tokens"):
+            try:
+                cache_obj._seen_tokens = int(full_indices.shape[1])
+            except Exception:
+                pass
+
     def _make_layer_forward(self, layer_idx: int):
         def new_forward(layer_self, hidden_states, attention_mask=None, position_ids=None, **kwargs):
             patch_t0 = time.perf_counter()
@@ -461,14 +539,33 @@ class MantisBaselinePrunePatch:
                 attentions = outputs[1] if len(outputs) > 1 else None
                 if attentions is None:
                     return clean_outputs()
-                scores = fastv_visual_scores(attentions, visual_positions, seq_len)
-                selected, keep_count = select_top_visual_positions(scores, visual_positions, self.config.target_token_num)
+                query_positions = None
+                if str(self.config.fastv_query_mode) in {"layout_text", "layout_text_no_choice"}:
+                    query_positions = layout.get("query_positions")
+                    self.runtime_stats["fastv_query_tokens"] = 0 if query_positions is None else int(query_positions.numel())
+                if str(self.config.fastv_visual_pool) == "per_view":
+                    view_positions = [view for view in layout.get("view_positions", []) if view.numel() > 0]
+                    keep_counts = self._allocate_keep_per_view(view_positions, self.config.target_token_num)
+                    selected_view_positions = []
+                    for view, keep_for_view in zip(view_positions, keep_counts):
+                        view_scores = fastv_visual_scores(attentions, view, seq_len, query_positions=query_positions)
+                        selected_view, _ = select_top_visual_positions(view_scores, view, keep_for_view)
+                        selected_view_positions.append(selected_view)
+                    keep_count = int(sum(keep_counts))
+                    self.runtime_stats["fastv_keep_per_view"] = [int(count) for count in keep_counts]
+                    self.runtime_stats["fastv_visual_pool"] = "per_view"
+                else:
+                    scores = fastv_visual_scores(attentions, visual_positions, seq_len, query_positions=query_positions)
+                    selected, keep_count = select_top_visual_positions(scores, visual_positions, self.config.target_token_num)
+                    selected_view_positions = [selected]
+                    self.runtime_stats["fastv_keep_per_view"] = []
+                    self.runtime_stats["fastv_visual_pool"] = "unified"
                 self.runtime_stats["topk_seconds"] += time.perf_counter() - score_t0
                 full_indices = build_full_indices(
                     batch_size=bsz,
                     seq_len=seq_len,
                     always_keep_positions=layout["always_keep_positions"],
-                    selected_view_positions=[selected],
+                    selected_view_positions=selected_view_positions,
                     device=hidden_states.device,
                 )
                 if full_indices.shape[1] >= seq_len:
@@ -477,6 +574,11 @@ class MantisBaselinePrunePatch:
                 new_hidden = outputs[0].gather(1, full_indices.unsqueeze(-1).expand(-1, -1, outputs[0].size(-1))).contiguous()
                 self.global_indices = self._current_global_indices(bsz, seq_len, hidden_states.device).gather(1, full_indices)
                 self.layout_cache = {}
+                if use_cache:
+                    cache_obj = outputs[2] if len(outputs) >= 3 else kwargs.get("past_key_value", None)
+                    self._prune_dynamic_cache(cache_obj, full_indices)
+                    self.runtime_stats["cache_pruned_to_seq_len"] = int(full_indices.shape[1])
+                    self.runtime_stats["cache_pruned_layers"] = int(len(getattr(cache_obj, "key_cache", []) or []))
                 self.runtime_stats["gather_seconds"] += time.perf_counter() - gather_t0
                 self._record_pruning_stats(
                     seq_len=seq_len,
@@ -484,7 +586,7 @@ class MantisBaselinePrunePatch:
                     visual_before=int(visual_positions.numel()),
                     visual_after=int(keep_count),
                 )
-                self.runtime_stats["fastv_attention_includes_all_nonvisual_tokens"] = 1
+                self.runtime_stats["fastv_attention_includes_all_nonvisual_tokens"] = int(query_positions is None)
                 if self.config.debug:
                     print(f"[MantisBaseline:fastv] layer={layer_idx} seq {seq_len}->{full_indices.shape[1]}, visual={keep_count}")
                 return clean_outputs(new_hidden)

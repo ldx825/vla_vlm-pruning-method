@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import PIL.Image
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, GenerationConfig
+from transformers import AutoConfig, AutoProcessor, Qwen2_5_VLForConditionalGeneration, GenerationConfig
 from typing import Optional, Union, Dict, Any
 from qwen_vl_utils import process_vision_info
 from huggingface_hub import hf_hub_download
@@ -210,14 +210,69 @@ class Nora:
         except Exception as e:
             raise RuntimeError(f"Error loading main processor from {model_path}: {e}")
 
+        full_model_state_path = kwargs.get("full_model_state_path")
+        lora_adapter_path = kwargs.get("lora_adapter_path")
+
         # --- Load Main Model ---
         try:
             print(f"Loading model from: {model_path}")
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_path,
-                torch_dtype=torch_dtype,
-            #    attn_implementation="flash_attention_2", # Comment out this line if there is an error with flash attention
-            )
+            if full_model_state_path:
+                from peft import LoraConfig, PeftConfig, get_peft_model
+                from safetensors.torch import load_file
+
+                print(f"Loading PEFT-wrapped local state from: {full_model_state_path}")
+                adapter_config_path = lora_adapter_path or str(Path(full_model_state_path).parent / "adapter")
+                config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+                self.model = Qwen2_5_VLForConditionalGeneration(config)
+                state_dict = load_file(str(full_model_state_path), device="cpu")
+                try:
+                    peft_config = PeftConfig.from_pretrained(adapter_config_path)
+                except Exception as peft_config_error:
+                    lora_a_key = next(
+                        key for key in state_dict
+                        if key.endswith(".lora_A.default.weight")
+                    )
+                    inferred_rank = int(state_dict[lora_a_key].shape[0])
+                    print(
+                        "Could not load adapter_config.json from "
+                        f"{adapter_config_path}: {peft_config_error}. "
+                        f"Inferring LoRA config with rank={inferred_rank}."
+                    )
+                    peft_config = LoraConfig(
+                        r=inferred_rank,
+                        lora_alpha=2 * inferred_rank,
+                        lora_dropout=0.0,
+                        bias="none",
+                        task_type="CAUSAL_LM",
+                        target_modules=[
+                            "q_proj",
+                            "k_proj",
+                            "v_proj",
+                            "o_proj",
+                            "gate_proj",
+                            "up_proj",
+                            "down_proj",
+                            "merger.mlp.0",
+                            "merger.mlp.2",
+                        ],
+                    )
+                self.model = get_peft_model(self.model, peft_config)
+                missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+                print(
+                    "Loaded local PEFT state: "
+                    f"missing={len(missing)}, unexpected={len(unexpected)}"
+                )
+                if missing[:8]:
+                    print(f"First missing keys: {missing[:8]}")
+                if unexpected[:8]:
+                    print(f"First unexpected keys: {unexpected[:8]}")
+                self.model = self.model.merge_and_unload()
+            else:
+                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    model_path,
+                    torch_dtype=torch_dtype,
+                #    attn_implementation="flash_attention_2", # Comment out this line if there is an error with flash attention
+                )
             self.model.to(self.device)
             # Load generation config and set specific parameters
             self.model.generation_config = GenerationConfig.from_pretrained(model_path)

@@ -54,3 +54,7 @@ pretrained/
 # System files
 .DS_Store
 Thumbs.db
+
+ldx/
+Mantis/
+results/

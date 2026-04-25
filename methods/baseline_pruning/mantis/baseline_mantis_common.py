@@ -49,6 +49,8 @@ class MantisBaselinePruneConfig:
     pyramiddrop_max_pruning_layers: int = 6
     pyramiddrop_layer_indices: Tuple[int, ...] = ()
     fastv_pruning_layer: int = 2
+    fastv_query_mode: str = "all_nonvisual"
+    fastv_visual_pool: str = "unified"
     sparsevlm_start_layer: int = 2
     sparsevlm_max_pruning_layers: int = 6
     sparsevlm_layer_indices: Tuple[int, ...] = ()
@@ -71,6 +73,8 @@ def build_mantis_baseline_config_from_env(prefix: str = "MANTIS_BASELINE_PRUNE_"
         pyramiddrop_max_pruning_layers=_parse_int(f"{prefix}PYRAMIDDROP_MAX_PRUNING_LAYERS", 6),
         pyramiddrop_layer_indices=_parse_int_tuple(f"{prefix}PYRAMIDDROP_LAYER_INDICES", ()),
         fastv_pruning_layer=_parse_int(f"{prefix}FASTV_PRUNING_LAYER", 2),
+        fastv_query_mode=os.environ.get(f"{prefix}FASTV_QUERY_MODE", "all_nonvisual").strip().lower(),
+        fastv_visual_pool=os.environ.get(f"{prefix}FASTV_VISUAL_POOL", "unified").strip().lower(),
         sparsevlm_start_layer=_parse_int(f"{prefix}SPARSEVLM_START_LAYER", 2),
         sparsevlm_max_pruning_layers=_parse_int(f"{prefix}SPARSEVLM_MAX_PRUNING_LAYERS", 6),
         sparsevlm_layer_indices=_parse_int_tuple(f"{prefix}SPARSEVLM_LAYER_INDICES", ()),

@@ -51,6 +51,7 @@ def prepare_input_layout_from_merge(
     attention_mask: Optional[torch.Tensor],
     image_token_index: int,
     visual_tokens_per_view: int,
+    query_token_limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     # Mirror Llava/Mantis _merge_input_ids_with_image_features so pruning
     # operates on real post-merge positions rather than guessed image spans.
@@ -63,8 +64,14 @@ def prepare_input_layout_from_merge(
     if left_padding:
         text_positions = text_positions + nb_image_pad
 
-    valid_text_positions = text_positions[(ids != image_token_index) & mask].to(torch.long)
+    valid_text_mask = (ids != image_token_index) & mask
+    valid_text_positions = text_positions[valid_text_mask].to(torch.long)
     marker_positions = text_positions[(ids == image_token_index) & mask].to(torch.long)
+    query_text_mask = valid_text_mask
+    if query_token_limit is not None:
+        raw_positions = torch.arange(ids.numel(), device=ids.device)
+        query_text_mask = query_text_mask & (raw_positions < int(query_token_limit))
+    query_positions = text_positions[query_text_mask].to(torch.long)
 
     occupied = torch.zeros(max_embed_dim, dtype=torch.bool, device=input_ids.device)
     if valid_text_positions.numel() > 0:
@@ -89,9 +96,10 @@ def prepare_input_layout_from_merge(
         "view_positions": view_positions,
         "all_visual_positions": image_positions,
         "always_keep_positions": torch.where(always_keep)[0].to(torch.long),
-        "query_positions": valid_text_positions,
+        "query_positions": query_positions,
         "num_views": int(len(view_positions)),
         "total_visual_tokens": int(image_positions.numel()),
+        "query_token_limit": None if query_token_limit is None else int(query_token_limit),
     }
 
 

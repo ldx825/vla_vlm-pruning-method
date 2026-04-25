@@ -15,6 +15,7 @@ def fastv_visual_scores(
     attentions: torch.Tensor,
     visual_positions: torch.Tensor,
     seq_len: int,
+    query_positions: torch.Tensor = None,
 ) -> torch.Tensor:
     # FastV paper step: after the first K decoder layers, estimate each visual
     # token's importance from attention paid by every other current token. This
@@ -26,9 +27,12 @@ def fastv_visual_scores(
     if attn.dim() != 3:
         raise ValueError(f"Unsupported attention shape for FastV: {tuple(attn.shape)}")
     device = attn.device
-    query_mask = torch.ones(seq_len, dtype=torch.bool, device=device)
-    query_mask[visual_positions.to(device=device, dtype=torch.long)] = False
-    query_positions = torch.where(query_mask)[0]
+    if query_positions is None:
+        query_mask = torch.ones(seq_len, dtype=torch.bool, device=device)
+        query_mask[visual_positions.to(device=device, dtype=torch.long)] = False
+        query_positions = torch.where(query_mask)[0]
+    else:
+        query_positions = query_positions.to(device=device, dtype=torch.long)
     if query_positions.numel() <= 0:
         query_positions = torch.arange(seq_len, device=device, dtype=torch.long)
     score = attn.index_select(1, query_positions).index_select(2, visual_positions.to(device)).mean(dim=1)
