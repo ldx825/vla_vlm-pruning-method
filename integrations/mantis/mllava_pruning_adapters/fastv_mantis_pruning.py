@@ -65,7 +65,10 @@ def estimate_fastv_flops_reduction(
         n = float(max(1, int(tokens_before)))
         n_hat = float(max(1, int(tokens_after)))
         total_layers = float(max(1, int(num_layers)))
-        k = float(max(0, min(int(start_layer), int(num_layers))))
+        # The patch prunes after the selected decoder layer has already run.
+        # Therefore layers [0, start_layer] use the original sequence length,
+        # and the reduced sequence starts at the following layer.
+        k = float(max(0, min(int(start_layer) + 1, int(num_layers))))
 
         # FastV paper Eq. 5: MHA + FFN layer cost is
         # 4*n*d^2 + 2*n^2*d + 2*n*d*m, before/after the pruning layer K.

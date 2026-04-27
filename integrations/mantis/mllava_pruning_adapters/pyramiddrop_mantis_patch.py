@@ -62,34 +62,10 @@ def _weighted_average_from_lambda(initial_visual_tokens: int, lam: float, stage_
     return total / float(total_layers)
 
 
-def _solve_lambda_for_weighted_average(
-    initial_visual_tokens: int,
-    target_average_tokens: int,
-    stage_lengths: List[int],
-) -> float:
-    if initial_visual_tokens <= 0 or not stage_lengths:
-        return 1.0
-    target_average_tokens = float(target_average_tokens)
-    if target_average_tokens >= float(initial_visual_tokens):
-        return 1.0
-    if target_average_tokens <= 0.0:
-        return 0.0
-
-    low, high = 0.0, 1.0
-    for _ in range(64):
-        mid = (low + high) * 0.5
-        avg_tokens = _weighted_average_from_lambda(initial_visual_tokens, mid, stage_lengths)
-        if avg_tokens < target_average_tokens:
-            low = mid
-        else:
-            high = mid
-    return float(high)
-
-
 def _build_exponential_keep_schedule(
     *,
     initial_visual_tokens: int,
-    target_average_tokens: int,
+    target_final_tokens: int,
     stage_lengths: List[int],
     min_keep_tokens: int,
 ) -> Dict[str, Any]:
@@ -107,20 +83,21 @@ def _build_exponential_keep_schedule(
             "keep_schedule": [],
             "stage_lengths": stage_lengths,
             "weighted_average_visual_tokens": float(initial_visual_tokens),
-            "target_average_clamped": int(initial_visual_tokens),
-            "average_clamped_by_stage_floor": False,
+            "target_final_clamped": int(initial_visual_tokens),
+            "target_clamped_by_bounds": False,
         }
 
     floor = max(1, min(int(min_keep_tokens), initial_visual_tokens))
-    total_layers = max(1, int(sum(stage_lengths)))
-    full_stage_layers = int(stage_lengths[0])
-    post_stage_layers = int(sum(stage_lengths[1:]))
-    min_weighted_average = (
-        float(initial_visual_tokens * full_stage_layers + floor * post_stage_layers) / float(total_layers)
-    )
-    clamped_target = max(min_weighted_average, min(float(target_average_tokens), float(initial_visual_tokens)))
-    average_clamped = abs(float(clamped_target) - float(target_average_tokens)) > 1e-6
-    lam = _solve_lambda_for_weighted_average(initial_visual_tokens, int(round(clamped_target)), stage_lengths)
+    clamped_target = max(floor, min(int(target_final_tokens), initial_visual_tokens))
+    target_clamped = int(clamped_target) != int(target_final_tokens)
+    if drop_count <= 1:
+        lam = float(clamped_target) / float(initial_visual_tokens)
+    else:
+        # The Mantis sweeps compare methods at an explicit final visual-token
+        # budget. Build an exponential PyramidDrop path whose last pruning
+        # stage lands on that budget, rather than treating the budget as a
+        # layer-weighted average; the latter over-prunes BLINK to one token.
+        lam = (float(clamped_target) / float(initial_visual_tokens)) ** (1.0 / float(drop_count))
 
     counts: List[int] = []
     previous = initial_visual_tokens
@@ -133,9 +110,11 @@ def _build_exponential_keep_schedule(
         counts.append(int(keep))
         previous = int(keep)
 
-    # Integer rounding can move the layer-weighted stage average by a few
-    # tokens. Repair while preserving the monotonic pyramid shape.
-    target_weighted_sum = int(round(float(clamped_target) * float(total_layers)))
+    if counts:
+        counts[-1] = int(clamped_target)
+        for idx in range(len(counts) - 2, -1, -1):
+            counts[idx] = max(int(counts[idx]), int(counts[idx + 1]))
+            counts[idx] = min(int(counts[idx]), initial_visual_tokens)
 
     def weighted_sum(values: List[int]) -> int:
         total = int(initial_visual_tokens) * int(stage_lengths[0])
@@ -143,50 +122,15 @@ def _build_exponential_keep_schedule(
             total += int(value) * int(stage_lengths[idx + 1])
         return int(total)
 
-    current_weighted_sum = weighted_sum(counts)
-    if current_weighted_sum > target_weighted_sum:
-        while current_weighted_sum > target_weighted_sum:
-            changed = False
-            for idx in range(len(counts) - 1, -1, -1):
-                if stage_lengths[idx + 1] <= 0:
-                    continue
-                lower = floor
-                if counts[idx] <= lower:
-                    continue
-                counts[idx] -= 1
-                for left in range(idx - 1, -1, -1):
-                    counts[left] = max(counts[left], counts[left + 1])
-                changed = True
-                current_weighted_sum = weighted_sum(counts)
-                if current_weighted_sum <= target_weighted_sum:
-                    break
-            if not changed:
-                break
-    elif current_weighted_sum < target_weighted_sum:
-        while current_weighted_sum < target_weighted_sum:
-            changed = False
-            for idx in range(len(counts)):
-                if stage_lengths[idx + 1] <= 0:
-                    continue
-                upper = initial_visual_tokens if idx == 0 else counts[idx - 1]
-                if counts[idx] >= upper:
-                    continue
-                counts[idx] += 1
-                changed = True
-                current_weighted_sum = weighted_sum(counts)
-                if current_weighted_sum >= target_weighted_sum:
-                    break
-            if not changed:
-                break
-
+    total_layers = max(1, int(sum(stage_lengths)))
     realized_average = float(weighted_sum(counts)) / float(total_layers)
     return {
         "lambda": float(lam),
         "keep_schedule": [int(value) for value in counts],
         "stage_lengths": [int(value) for value in stage_lengths],
         "weighted_average_visual_tokens": float(realized_average),
-        "target_average_clamped": float(clamped_target),
-        "average_clamped_by_stage_floor": bool(average_clamped),
+        "target_final_clamped": int(clamped_target),
+        "target_clamped_by_bounds": bool(target_clamped),
     }
 
 
@@ -497,7 +441,7 @@ class MantisPyramidDropPatch:
                 stage_lengths = _build_runtime_stage_lengths(self.num_layers, self.pruning_loc)
                 schedule = _build_exponential_keep_schedule(
                     initial_visual_tokens=int(visual_positions.numel()),
-                    target_average_tokens=int(self.config.target_token_num),
+                    target_final_tokens=int(self.config.target_token_num),
                     stage_lengths=stage_lengths,
                     min_keep_tokens=int(self.config.min_keep_tokens),
                 )
@@ -511,12 +455,14 @@ class MantisPyramidDropPatch:
                     schedule.get("weighted_average_visual_tokens", 0.0)
                 )
                 self.runtime_stats["pyramiddrop_target_average_visual_tokens"] = float(self.config.target_token_num)
-                self.runtime_stats["pyramiddrop_target_average_clamped"] = float(
-                    schedule.get("target_average_clamped", self.config.target_token_num)
+                self.runtime_stats["pyramiddrop_target_final_visual_tokens"] = int(self.config.target_token_num)
+                self.runtime_stats["pyramiddrop_target_final_clamped"] = int(
+                    schedule.get("target_final_clamped", self.config.target_token_num)
                 )
-                self.runtime_stats["pyramiddrop_average_clamped_by_stage_floor"] = int(
-                    bool(schedule.get("average_clamped_by_stage_floor", False))
+                self.runtime_stats["pyramiddrop_target_clamped_by_bounds"] = int(
+                    bool(schedule.get("target_clamped_by_bounds", False))
                 )
+                self.runtime_stats["configured_visual_budget_cap"] = int(self.config.target_token_num)
                 self.runtime_stats["total_budget"] = int(self.config.target_token_num)
                 self.runtime_stats["target_keep_per_view"] = [int(self.config.target_token_num)]
                 self.runtime_stats["keep_count_schedule"] = [int(value) for value in self.keep_count_schedule]

@@ -385,8 +385,18 @@ class Nora:
             repo_id = "declare-lab/nora"
             filename = "norm_stats.json"
 
-            # Download the norm_stats locally (only downloads once; cached)
-            file_path = hf_hub_download(repo_id=repo_id, filename=filename)
+            norm_stats_path = os.environ.get("NORA_NORM_STATS_PATH")
+            if norm_stats_path and not os.path.exists(norm_stats_path):
+                raise FileNotFoundError(f"NORA_NORM_STATS_PATH does not exist: {norm_stats_path}")
+
+            if norm_stats_path:
+                file_path = norm_stats_path
+            else:
+                try:
+                    file_path = hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True)
+                except Exception:
+                    # Fall back to the previous online behavior when the cache is missing.
+                    file_path = hf_hub_download(repo_id=repo_id, filename=filename)
 
             # Load the JSON file
             with open(file_path, "r") as f:
@@ -587,6 +597,12 @@ class Nora:
         action_dim = int(self.fast_tokenizer.action_dim or 7)
         expected_coeffs = time_horizon * action_dim
         if self.stop_at_expected_action_length:
+            # Nora-LIBERO action decoding is extremely compact in practice: across
+            # prior formal runs on this machine, normal generations stayed within
+            # 20 new tokens while pathological outliers exploded far beyond that.
+            # Keep the semantic stop criterion, but also add a hard decode cap so
+            # rare bad generations cannot dominate latency.
+            generate_kwargs.setdefault("max_new_tokens", max(20, int(np.ceil(expected_coeffs * 0.55))))
             generate_kwargs["stopping_criteria"] = StoppingCriteriaList([
                 _ExpectedActionCoeffStoppingCriteria(
                     action_token_min=self._ACTION_TOKEN_MIN,
@@ -677,6 +693,10 @@ class Nora:
         final_visual_tokens = 0.0
         raw_total_budget = 0.0
         active_pruning_layers = 0.0
+        expected_compacted_seq_len = 0.0
+        decode_cache_seq_len_layer0 = 0.0
+        decode_expected_visual_tokens_layer0 = 0.0
+        decode_expected_total_seq_len_layer0 = 0.0
         patch_total = 0.0
         force_attn = 0.0
         force_attn_self_attn = 0.0
@@ -743,6 +763,10 @@ class Nora:
             final_visual_tokens = float(stats.get("final_visual_tokens", 0.0) or 0.0)
             raw_total_budget = float(stats.get("raw_total_budget", 0.0) or 0.0)
             active_pruning_layers = float(stats.get("active_pruning_layers", 0.0) or 0.0)
+            expected_compacted_seq_len = float(stats.get("expected_compacted_seq_len", 0.0) or 0.0)
+            decode_cache_seq_len_layer0 = float(stats.get("decode_cache_seq_len_layer0", 0.0) or 0.0)
+            decode_expected_visual_tokens_layer0 = float(stats.get("decode_expected_visual_tokens_layer0", 0.0) or 0.0)
+            decode_expected_total_seq_len_layer0 = float(stats.get("decode_expected_total_seq_len_layer0", 0.0) or 0.0)
 
         self.last_inference_profile = {
             "preprocess_seconds": float(preprocess_seconds),
@@ -795,6 +819,10 @@ class Nora:
             "final_visual_tokens": final_visual_tokens,
             "raw_total_budget": raw_total_budget,
             "active_pruning_layers": active_pruning_layers,
+            "expected_compacted_seq_len": expected_compacted_seq_len,
+            "decode_cache_seq_len_layer0": decode_cache_seq_len_layer0,
+            "decode_expected_visual_tokens_layer0": decode_expected_visual_tokens_layer0,
+            "decode_expected_total_seq_len_layer0": decode_expected_total_seq_len_layer0,
         }
 
         if unnormalizer is not None:

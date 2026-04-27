@@ -233,6 +233,18 @@ def estimate_sparsevlm_flops_reduction(
     if not layer_records or prefill_seq_len is None:
         return None
     try:
+        language_config = getattr(config, "text_config", None) or getattr(config, "language_config", None) or config
+        hidden_size = int(getattr(language_config, "hidden_size", 0) or 0)
+        intermediate_size = int(getattr(language_config, "intermediate_size", 0) or 0)
+        if hidden_size <= 0 or intermediate_size <= 0:
+            return None
+
+        def layer_cost(seq_len: int) -> float:
+            n = float(max(1, int(seq_len)))
+            d = float(hidden_size)
+            m = float(intermediate_size)
+            return 4.0 * n * d * d + 2.0 * n * n * d + 2.0 * n * d * m
+
         baseline_tokens = int(prefill_seq_len)
         total_baseline = 0.0
         total_sparse = 0.0
@@ -245,16 +257,11 @@ def estimate_sparsevlm_flops_reduction(
                 after = int(record_by_layer[layer_idx]["tokens_after"])
             else:
                 after = before
-            layer_reduction = estimate_fastv_flops_reduction(
-                config=config,
-                num_layers=1,
-                start_layer=0,
-                tokens_before=baseline_tokens,
-                tokens_after=after,
-            )
-            layer_cost_ratio = 1.0 - float(layer_reduction or 0.0)
-            total_baseline += 1.0
-            total_sparse += layer_cost_ratio
+            # Each pruning record is produced after that layer's forward pass.
+            # Count the pruning layer itself with `before`; the `after` length
+            # only affects subsequent layers.
+            total_baseline += layer_cost(baseline_tokens)
+            total_sparse += layer_cost(before)
             current_tokens = after
         return float(max(0.0, min(1.0, 1.0 - total_sparse / max(1e-9, total_baseline))))
     except Exception:

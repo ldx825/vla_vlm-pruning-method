@@ -24,6 +24,7 @@ from .autoprune_mantis_pruning import (
     compute_schedule_from_attn,
     select_view_token_indices,
 )
+from .sparsevlm_mantis_pruning import estimate_sparsevlm_flops_reduction
 
 
 class MantisAutoPrunePatch:
@@ -119,6 +120,7 @@ class MantisAutoPrunePatch:
         self.runtime_stats["adaptive_layer_choices"] = [
             int(value) for value in getattr(self.config, "adaptive_layer_choices", ())
         ]
+        self.runtime_stats["autoprune_layer_records"] = []
 
     def _invalidate_layout_cache(self) -> None:
         self.layout_cache = {}
@@ -405,6 +407,24 @@ class MantisAutoPrunePatch:
             self.runtime_stats["pruned_layers"] += 1
             self.runtime_stats["last_tokens_before"] = int(seq_len)
             self.runtime_stats["last_tokens_after"] = int(full_indices.shape[1])
+            self.runtime_stats.setdefault("autoprune_layer_records", [])
+            self.runtime_stats["autoprune_layer_records"].append(
+                {
+                    "layer_idx": int(layer_idx),
+                    "tokens_before": int(seq_len),
+                    "tokens_after": int(full_indices.shape[1]),
+                    "visual_after": int(full_indices.shape[1] - layout["always_keep_positions"].numel()),
+                    "target_keep_per_view": [int(value) for value in target_keep_per_view],
+                }
+            )
+            flops_reduction = estimate_sparsevlm_flops_reduction(
+                config=getattr(self.model, "config", None),
+                num_layers=self.num_layers,
+                layer_records=self.runtime_stats.get("autoprune_layer_records", []),
+                prefill_seq_len=self.runtime_stats.get("prefill_seq_len"),
+            )
+            self.runtime_stats["flops_reduction"] = flops_reduction
+            self.runtime_stats["flops_reduction_ratio"] = flops_reduction
             if self.config.debug:
                 print(
                     "[MantisAutoPrune] "
