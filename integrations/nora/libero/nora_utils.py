@@ -379,6 +379,8 @@ class Nora:
             # Load generation config and set specific parameters
             self.model.generation_config = GenerationConfig.from_pretrained(model_path)
             self.model.generation_config.do_sample = False # Ensure deterministic output
+            if compare_pruning_config is not None and compare_pruning_config.enabled:
+                self.model.generation_config.use_cache = True
 
             self.model.eval() # Set the model to evaluation mode
 
@@ -722,6 +724,12 @@ class Nora:
         layout_view0_tokens = 0.0
         layout_view1_tokens = 0.0
         manual_attention_probe_layers = 0.0
+        attention_mask_gathered = 0.0
+        attention_mask_dropped = 0.0
+        cache_layer0_seq_len = 0.0
+        cache_min_seq_len = 0.0
+        cache_max_seq_len = 0.0
+        cache_unique_seq_lens = 0.0
         if self.autoprune_patch is not None:
             stats = self.autoprune_patch.runtime_stats or {}
             patch_total = float(stats.get("patch_total_seconds", 0.0) or 0.0)
@@ -767,6 +775,12 @@ class Nora:
             decode_cache_seq_len_layer0 = float(stats.get("decode_cache_seq_len_layer0", 0.0) or 0.0)
             decode_expected_visual_tokens_layer0 = float(stats.get("decode_expected_visual_tokens_layer0", 0.0) or 0.0)
             decode_expected_total_seq_len_layer0 = float(stats.get("decode_expected_total_seq_len_layer0", 0.0) or 0.0)
+            attention_mask_gathered = float(stats.get("attention_mask_gathered", 0.0) or 0.0)
+            attention_mask_dropped = float(stats.get("attention_mask_dropped", 0.0) or 0.0)
+            cache_layer0_seq_len = float(stats.get("cache_layer0_seq_len", 0.0) or 0.0)
+            cache_min_seq_len = float(stats.get("cache_min_seq_len", 0.0) or 0.0)
+            cache_max_seq_len = float(stats.get("cache_max_seq_len", 0.0) or 0.0)
+            cache_unique_seq_lens = float(stats.get("cache_unique_seq_lens", 0.0) or 0.0)
 
         self.last_inference_profile = {
             "preprocess_seconds": float(preprocess_seconds),
@@ -823,6 +837,12 @@ class Nora:
             "decode_cache_seq_len_layer0": decode_cache_seq_len_layer0,
             "decode_expected_visual_tokens_layer0": decode_expected_visual_tokens_layer0,
             "decode_expected_total_seq_len_layer0": decode_expected_total_seq_len_layer0,
+            "attention_mask_gathered": attention_mask_gathered,
+            "attention_mask_dropped": attention_mask_dropped,
+            "cache_layer0_seq_len": cache_layer0_seq_len,
+            "cache_min_seq_len": cache_min_seq_len,
+            "cache_max_seq_len": cache_max_seq_len,
+            "cache_unique_seq_lens": cache_unique_seq_lens,
         }
 
         if unnormalizer is not None:

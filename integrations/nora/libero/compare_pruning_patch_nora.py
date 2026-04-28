@@ -467,6 +467,12 @@ class NoraComparePruningPatch:
             "visionzip_dominant_tokens": 0,
             "visionzip_contextual_tokens": 0,
             "pyramiddrop_lambda": 0.0,
+            "attention_mask_gathered": 0,
+            "attention_mask_dropped": 0,
+            "cache_layer0_seq_len": 0,
+            "cache_min_seq_len": 0,
+            "cache_max_seq_len": 0,
+            "cache_unique_seq_lens": 0,
         }
 
     def get_flops_reduction(self) -> float:
@@ -911,6 +917,76 @@ class NoraComparePruningPatch:
             self.runtime_stats["layer_tokens"][layer_idx] = int(seq_len)
         self._finalize_decoder_flops_stats()
 
+    def _record_cache_lengths(self, past_key_value: Any) -> None:
+        key_cache = getattr(past_key_value, "key_cache", None)
+        if not isinstance(key_cache, list) or not key_cache:
+            return
+        lengths: List[int] = []
+        for cache_tensor in key_cache:
+            if torch.is_tensor(cache_tensor) and cache_tensor.numel() > 0 and cache_tensor.dim() >= 3:
+                lengths.append(int(cache_tensor.shape[-2]))
+        if not lengths:
+            return
+        self.runtime_stats["cache_layer0_seq_len"] = int(lengths[0])
+        self.runtime_stats["cache_min_seq_len"] = int(min(lengths))
+        self.runtime_stats["cache_max_seq_len"] = int(max(lengths))
+        self.runtime_stats["cache_unique_seq_lens"] = int(len(set(lengths)))
+
+    def _align_attention_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        seq_len: int,
+        batch_size: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if attention_mask is None:
+            return None
+        if attention_mask.dim() == 4 and attention_mask.shape[-2] == seq_len and attention_mask.shape[-1] == seq_len:
+            return attention_mask
+        if attention_mask.dim() == 2 and attention_mask.shape[-1] == seq_len:
+            return attention_mask
+
+        # After a PyramidDrop stage boundary, Qwen has already built a full
+        # prefill causal mask outside the decoder loop.  Gather both query and
+        # key axes by the current global token ids so eager attention keeps the
+        # exact causal structure for the shortened sequence instead of running
+        # unmasked.
+        if self.global_indices is not None:
+            gather_idx = self.global_indices.to(device=device, dtype=torch.long)
+            if gather_idx.shape[0] == 1 and batch_size > 1:
+                gather_idx = gather_idx.expand(batch_size, -1)
+            max_idx = int(gather_idx.max().item()) if gather_idx.numel() > 0 else -1
+            try:
+                if (
+                    attention_mask.dim() == 4
+                    and attention_mask.shape[-2] > max_idx
+                    and attention_mask.shape[-1] > max_idx
+                ):
+                    if attention_mask.shape[0] == 1 and batch_size > 1:
+                        attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
+                    heads = attention_mask.shape[1]
+                    q_idx = gather_idx.view(batch_size, 1, seq_len, 1).expand(
+                        batch_size, heads, seq_len, attention_mask.shape[-1]
+                    )
+                    gathered = attention_mask.gather(2, q_idx)
+                    k_idx = gather_idx.view(batch_size, 1, 1, seq_len).expand(batch_size, heads, seq_len, seq_len)
+                    gathered = gathered.gather(3, k_idx).contiguous()
+                    self.runtime_stats["attention_mask_gathered"] = int(
+                        self.runtime_stats.get("attention_mask_gathered", 0) + 1
+                    )
+                    return gathered
+                if attention_mask.dim() == 2 and attention_mask.shape[-1] > max_idx:
+                    gathered = attention_mask.gather(1, gather_idx).contiguous()
+                    self.runtime_stats["attention_mask_gathered"] = int(
+                        self.runtime_stats.get("attention_mask_gathered", 0) + 1
+                    )
+                    return gathered
+            except Exception:
+                pass
+
+        self.runtime_stats["attention_mask_dropped"] = int(self.runtime_stats.get("attention_mask_dropped", 0) + 1)
+        return None
+
     def _run_sparsevlm_joint_pruning(
         self,
         current_layer_output: torch.Tensor,
@@ -1093,8 +1169,13 @@ class NoraComparePruningPatch:
                     expanded = gather_idx.unsqueeze(0).expand(position_ids.shape[0], -1, -1)
                     position_ids = position_ids.gather(2, expanded)
 
-            if attention_mask is not None and attention_mask.shape[-1] != seq_len:
-                attention_mask = None
+            attention_mask = self._align_attention_mask(
+                attention_mask=attention_mask,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                device=hidden_states.device,
+            )
+            self._record_cache_lengths(kwargs.get("past_key_value", None))
 
             if "position_embeddings" in kwargs and kwargs["position_embeddings"] is not None:
                 try:

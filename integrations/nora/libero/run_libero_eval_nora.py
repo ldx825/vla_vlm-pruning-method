@@ -483,6 +483,12 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
         "final_visual_tokens": 0.0,
         "raw_total_budget": 0.0,
         "active_pruning_layers": 0.0,
+        "attention_mask_gathered": 0.0,
+        "attention_mask_dropped": 0.0,
+        "cache_layer0_seq_len": 0.0,
+        "cache_min_seq_len": 0.0,
+        "cache_max_seq_len": 0.0,
+        "cache_unique_seq_lens": 0.0,
     }
     per_step_latency_rows = []
     task_start_id = max(0, min(int(cfg.task_start_id), num_tasks_in_suite))
@@ -630,6 +636,12 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
                             timing_totals["final_visual_tokens"] += float(profile.get("final_visual_tokens", 0.0))
                             timing_totals["raw_total_budget"] += float(profile.get("raw_total_budget", 0.0))
                             timing_totals["active_pruning_layers"] += float(profile.get("active_pruning_layers", 0.0))
+                            timing_totals["attention_mask_gathered"] += float(profile.get("attention_mask_gathered", 0.0))
+                            timing_totals["attention_mask_dropped"] += float(profile.get("attention_mask_dropped", 0.0))
+                            timing_totals["cache_layer0_seq_len"] += float(profile.get("cache_layer0_seq_len", 0.0))
+                            timing_totals["cache_min_seq_len"] += float(profile.get("cache_min_seq_len", 0.0))
+                            timing_totals["cache_max_seq_len"] += float(profile.get("cache_max_seq_len", 0.0))
+                            timing_totals["cache_unique_seq_lens"] += float(profile.get("cache_unique_seq_lens", 0.0))
                             per_step_latency_rows.append({
                                 "task_id": int(task_id),
                                 "episode_idx": int(episode_idx),
@@ -680,6 +692,12 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
                                 "final_visual_tokens": float(profile.get("final_visual_tokens", 0.0)),
                                 "raw_total_budget": float(profile.get("raw_total_budget", 0.0)),
                                 "active_pruning_layers": float(profile.get("active_pruning_layers", 0.0)),
+                                "attention_mask_gathered": float(profile.get("attention_mask_gathered", 0.0)),
+                                "attention_mask_dropped": float(profile.get("attention_mask_dropped", 0.0)),
+                                "cache_layer0_seq_len": float(profile.get("cache_layer0_seq_len", 0.0)),
+                                "cache_min_seq_len": float(profile.get("cache_min_seq_len", 0.0)),
+                                "cache_max_seq_len": float(profile.get("cache_max_seq_len", 0.0)),
+                                "cache_unique_seq_lens": float(profile.get("cache_unique_seq_lens", 0.0)),
                             })
                     #print(action.shape)
                     
