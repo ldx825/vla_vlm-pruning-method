@@ -1,13 +1,18 @@
 # Python and editor artifacts
 __pycache__/
 *.py[cod]
+*.pyo
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 .ipynb_checkpoints/
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # Environments
 .venv/
@@ -15,6 +20,8 @@ venv/
 env/
 miniconda3/
 *.conda
+.env
+.env.*
 
 # Model weights and checkpoints
 checkpoints/
@@ -39,6 +46,11 @@ pretrained/
 *.tfrecord*
 *.hdf5
 *.h5
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.jsonl
 
 # Experiment outputs
 **/logs/
@@ -47,17 +59,38 @@ pretrained/
 **/wandb/
 **/runs/
 **/rollouts/
+tensorboard/
+events.out.tfevents*
+nohup.out
+*.log
 *.mp4
 *.avi
 *.mov
+*.gif
+
+# Runtime and temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.pid
+*.prof
+*.trace
+*.sqlite
+*.db
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
 
 # System files
 .DS_Store
 Thumbs.db
 
-ldx/
-Mantis/
-jarvis/
-results/
-Auto_openvla-oft/
-mllava/
+/ldx/
+/jarvis/
+/results/
+/Auto_openvla-oft/
+/mllava/
+/Mantis/
