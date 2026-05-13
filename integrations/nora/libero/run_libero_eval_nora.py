@@ -29,6 +29,7 @@ from typing import Optional, Union
 
 import draccus
 import numpy as np
+import torch
 import tqdm
 import wandb
 from libero.libero import benchmark
@@ -44,12 +45,20 @@ from robot_utils import DATE_TIME, get_image_resize_size, invert_gripper_action,
 from nora_utils import Nora
 from autoprune_nora import NoraAutoPruneConfig
 from compare_pruning_patch_nora import NoraComparePruningConfig
+from vlapruner_nora import NoraVLAPrunerConfig
+from vlaadp_nora import NoraVLAADPConfig
 
 
 # Keep latency accounting identical to OpenVLA eval script: per inference call,
 # skip the first measured call as warmup.
 GLOBAL_INFERENCE_TIME = 0.0
 GLOBAL_INFERENCE_COUNT = 0
+
+
+def sync_model_cuda(model) -> None:
+    device = getattr(model, "device", None)
+    if isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize(device=device)
 
 
 def parse_bool(value):
@@ -259,6 +268,44 @@ class GenerateConfig:
     compare_debug: bool = False
 
     #################################################################################################################
+    # VLA-Pruner baseline (NORA, unified visual token pool)
+    #################################################################################################################
+    enable_vlapruner: bool = False
+    vlapruner_keep_visual_tokens: int = 224          # Final visual token count to keep, not pruning ratio
+    vlapruner_visual_tokens: int = 512
+    vlapruner_num_views: int = 2
+    vlapruner_pruning_layer: int = 3                 # Paper K; 1-based layer, prune after this layer
+    vlapruner_temporal_window: int = 3               # Paper temporal window w
+    vlapruner_temporal_gamma: float = 0.8            # Paper temporal decay gamma
+    vlapruner_warmup_steps: int = 3                  # Warm-start control steps before pruning
+    vlapruner_action_attention_layer_start: str = "half"
+    vlapruner_calibrate_average_keep: bool = True
+    vlapruner_measured_skip_initial_calls: int = 1
+    vlapruner_average_target_measured_steps: int = 40
+    vlapruner_debug: bool = False
+
+    #################################################################################################################
+    # VLA-ADP baseline (NORA, action-aware dynamic prefill pruning)
+    #################################################################################################################
+    enable_vlaadp: bool = False
+    vlaadp_keep_visual_tokens: int = 224             # Total visual tokens to keep across all views, not pruning ratio
+    vlaadp_visual_tokens: int = 512
+    vlaadp_num_views: int = 2
+    vlaadp_qk_layer: int = 0                         # Paper default: use layer-0 W_Q/W_K before LLM fusion
+    vlaadp_main_view_weight: float = 0.4             # Paper multi-view allocation: main:wrist = 4:6
+    vlaadp_wrist_view_weight: float = 0.6
+    vlaadp_chunk_size: int = 5                       # NORA-LONG action chunk size
+    vlaadp_cold_start_windows: int = 2
+    vlaadp_decision_method: str = "adjacent"
+    vlaadp_delta_method: str = "net"
+    vlaadp_adjacent_extrema_window: int = 3
+    vlaadp_adjacent_last_state: bool = False
+    vlaadp_limit_consecutive_pruned_enabled: bool = True
+    vlaadp_limit_max_consecutive_pruned: int = 3
+    vlaadp_min_keep_per_view: int = 1
+    vlaadp_debug: bool = False
+
+    #################################################################################################################
     # Utils
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add in run ID for logging
@@ -283,8 +330,16 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
 
     cfg = apply_autoprune_preset(cfg)
-    if cfg.enable_autoprune and cfg.enable_compare_pruning:
-        raise ValueError("AutoPrune and compare pruning baselines cannot be enabled at the same time.")
+    enabled_pruners = (
+        int(bool(cfg.enable_autoprune))
+        + int(bool(cfg.enable_compare_pruning))
+        + int(bool(cfg.enable_vlapruner))
+        + int(bool(cfg.enable_vlaadp))
+    )
+    if enabled_pruners > 1:
+        raise ValueError(
+            "AutoPrune, compare pruning baselines, VLA-Pruner, and VLA-ADP cannot be enabled at the same time."
+        )
     budget_mode = str(getattr(cfg, "autoprune_budget_mode", "absolute") or "absolute").strip().lower()
     budget_semantics = str(getattr(cfg, "autoprune_budget_semantics", "final_cap") or "final_cap").strip().lower()
     using_absolute_area = budget_mode == "absolute" and budget_semantics == "area"
@@ -379,6 +434,40 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
             detailed_timing=cfg.compare_detailed_timing,
             debug=cfg.compare_debug,
         ),
+        vlapruner_config=NoraVLAPrunerConfig(
+            enabled=cfg.enable_vlapruner,
+            keep_visual_tokens=cfg.vlapruner_keep_visual_tokens,
+            visual_tokens=cfg.vlapruner_visual_tokens,
+            num_views=cfg.vlapruner_num_views,
+            pruning_layer=cfg.vlapruner_pruning_layer,
+            temporal_window=cfg.vlapruner_temporal_window,
+            temporal_gamma=cfg.vlapruner_temporal_gamma,
+            warmup_steps=cfg.vlapruner_warmup_steps,
+            action_attention_layer_start=cfg.vlapruner_action_attention_layer_start,
+            calibrate_average_keep=cfg.vlapruner_calibrate_average_keep,
+            measured_skip_initial_calls=cfg.vlapruner_measured_skip_initial_calls,
+            average_target_measured_steps=cfg.vlapruner_average_target_measured_steps,
+            debug=cfg.vlapruner_debug,
+        ),
+        vlaadp_config=NoraVLAADPConfig(
+            enabled=cfg.enable_vlaadp,
+            keep_visual_tokens=cfg.vlaadp_keep_visual_tokens,
+            visual_tokens=cfg.vlaadp_visual_tokens,
+            num_views=cfg.vlaadp_num_views,
+            qk_layer=cfg.vlaadp_qk_layer,
+            main_view_weight=cfg.vlaadp_main_view_weight,
+            wrist_view_weight=cfg.vlaadp_wrist_view_weight,
+            chunk_size=cfg.vlaadp_chunk_size,
+            cold_start_windows=cfg.vlaadp_cold_start_windows,
+            decision_method=cfg.vlaadp_decision_method,
+            delta_method=cfg.vlaadp_delta_method,
+            adjacent_extrema_window=cfg.vlaadp_adjacent_extrema_window,
+            adjacent_last_state=cfg.vlaadp_adjacent_last_state,
+            limit_consecutive_pruned_enabled=cfg.vlaadp_limit_consecutive_pruned_enabled,
+            limit_max_consecutive_pruned=cfg.vlaadp_limit_max_consecutive_pruned,
+            min_keep_per_view=cfg.vlaadp_min_keep_per_view,
+            debug=cfg.vlaadp_debug,
+        ),
     )
     model.fast_tokenizer.time_horizon = cfg.action_horizon
 
@@ -467,6 +556,7 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
         "manual_probe_qk_cache_hits": 0.0,
         "manual_probe_qk_cache_misses": 0.0,
         "manual_probe_reused_layers": 0.0,
+        "adp_gate_seconds": 0.0,
         "planned_compaction_layers": 0.0,
         "generated_token_count": 0.0,
         "action_token_count": 0.0,
@@ -519,6 +609,9 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
 
             # Reset environment
             env.reset()
+            patch_ref = getattr(model, "autoprune_patch", None)
+            if patch_ref is not None and hasattr(patch_ref, "reset_episode_history"):
+                patch_ref.reset_episode_history()
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
@@ -570,6 +663,7 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
                     timing_totals["obs_preprocess_seconds"] += (time.perf_counter() - obs_prep_t0)
 
                     # Query model to get action
+                    sync_model_cuda(model)
                     t_start = time.perf_counter()
                     action = model.inference(
                         observation["image_primary"],
@@ -577,6 +671,14 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
                         task_description,
                         cfg.task_suite_name,
                     )
+                    adp_gate_t0 = time.perf_counter()
+                    patch_ref = getattr(model, "autoprune_patch", None)
+                    if patch_ref is not None and hasattr(patch_ref, "observe_action_sequence"):
+                        # VLA-ADP Step 10 -> Step 7 feedback: use the action chunk(s)
+                        # produced by this forward as virtual windows for the next gate decision.
+                        patch_ref.observe_action_sequence(np.asarray(action), start_obs=obs)
+                    adp_gate_seconds = time.perf_counter() - adp_gate_t0
+                    sync_model_cuda(model)
                     t_end = time.perf_counter()
                     # Same behavior as OpenVLA script: skip warmup by excluding the
                     # first measured call in an episode (t == num_steps_wait).
@@ -620,6 +722,7 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
                             timing_totals["manual_probe_qk_cache_hits"] += float(profile.get("manual_probe_qk_cache_hits", 0.0))
                             timing_totals["manual_probe_qk_cache_misses"] += float(profile.get("manual_probe_qk_cache_misses", 0.0))
                             timing_totals["manual_probe_reused_layers"] += float(profile.get("manual_probe_reused_layers", 0.0))
+                            timing_totals["adp_gate_seconds"] += float(adp_gate_seconds)
                             timing_totals["planned_compaction_layers"] += float(profile.get("planned_compaction_layers", 0.0))
                             timing_totals["generated_token_count"] += float(profile.get("generated_token_count", 0.0))
                             timing_totals["action_token_count"] += float(profile.get("action_token_count", 0.0))
@@ -681,6 +784,7 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
                                 "manual_probe_qk_cache_hits": float(profile.get("manual_probe_qk_cache_hits", 0.0)),
                                 "manual_probe_qk_cache_misses": float(profile.get("manual_probe_qk_cache_misses", 0.0)),
                                 "manual_probe_reused_layers": float(profile.get("manual_probe_reused_layers", 0.0)),
+                                "adp_gate_seconds": float(adp_gate_seconds),
                                 "planned_compaction_layers": float(profile.get("planned_compaction_layers", 0.0)),
                                 "generated_token_count": float(profile.get("generated_token_count", 0.0)),
                                 "action_token_count": float(profile.get("action_token_count", 0.0)),
@@ -825,6 +929,7 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
         avg_manual_probe_qk_cache_hits = timing_totals["manual_probe_qk_cache_hits"] / GLOBAL_INFERENCE_COUNT
         avg_manual_probe_qk_cache_misses = timing_totals["manual_probe_qk_cache_misses"] / GLOBAL_INFERENCE_COUNT
         avg_manual_probe_reused_layers = timing_totals["manual_probe_reused_layers"] / GLOBAL_INFERENCE_COUNT
+        avg_adp_gate_ms = (timing_totals["adp_gate_seconds"] / GLOBAL_INFERENCE_COUNT) * 1000.0
         avg_planned_compaction_layers = timing_totals["planned_compaction_layers"] / GLOBAL_INFERENCE_COUNT
         avg_generated_token_count = timing_totals["generated_token_count"] / GLOBAL_INFERENCE_COUNT
         avg_action_token_count = timing_totals["action_token_count"] / GLOBAL_INFERENCE_COUNT
@@ -871,6 +976,7 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
         print(f"  - TopK time: {avg_topk_ms:.2f}")
         print(f"  - Gather time: {avg_gather_ms:.2f}")
         print(f"  - Compaction bookkeeping time: {avg_compaction_bookkeeping_ms:.2f}")
+        print(f"  - ADP gate update time: {avg_adp_gate_ms:.4f}")
         print(f"  - Avg visual tokens before prune: {avg_last_tokens_before:.2f}")
         print(f"  - Avg visual tokens after prune: {avg_last_tokens_after:.2f}")
         print(f"  - Avg final visual tokens: {avg_final_visual_tokens:.2f}")
@@ -932,6 +1038,7 @@ def run_eval_libero(cfg: GenerateConfig) -> None:
         log_file.write(f"  - TopK time: {avg_topk_ms:.2f}\n")
         log_file.write(f"  - Gather time: {avg_gather_ms:.2f}\n")
         log_file.write(f"  - Compaction bookkeeping time: {avg_compaction_bookkeeping_ms:.2f}\n")
+        log_file.write(f"  - ADP gate update time: {avg_adp_gate_ms:.4f}\n")
         log_file.write(f"  - Avg visual tokens before prune: {avg_last_tokens_before:.2f}\n")
         log_file.write(f"  - Avg visual tokens after prune: {avg_last_tokens_after:.2f}\n")
         log_file.write(f"  - Avg final visual tokens: {avg_final_visual_tokens:.2f}\n")
@@ -1083,6 +1190,40 @@ def parse_args() -> GenerateConfig:
     parser.add_argument("--compare_pyramiddrop_lambda", type=float, default=defaults.compare_pyramiddrop_lambda)
     parser.add_argument("--compare_detailed_timing", type=parse_bool, default=defaults.compare_detailed_timing)
     parser.add_argument("--compare_debug", type=parse_bool, default=defaults.compare_debug)
+    parser.add_argument("--enable_vlapruner", type=parse_bool, default=defaults.enable_vlapruner)
+    parser.add_argument("--vlapruner_keep_visual_tokens", type=int, default=defaults.vlapruner_keep_visual_tokens)
+    parser.add_argument("--vlapruner_visual_tokens", type=int, default=defaults.vlapruner_visual_tokens)
+    parser.add_argument("--vlapruner_num_views", type=int, default=defaults.vlapruner_num_views)
+    parser.add_argument("--vlapruner_pruning_layer", type=int, default=defaults.vlapruner_pruning_layer)
+    parser.add_argument("--vlapruner_temporal_window", type=int, default=defaults.vlapruner_temporal_window)
+    parser.add_argument("--vlapruner_temporal_gamma", type=float, default=defaults.vlapruner_temporal_gamma)
+    parser.add_argument("--vlapruner_warmup_steps", type=int, default=defaults.vlapruner_warmup_steps)
+    parser.add_argument("--vlapruner_action_attention_layer_start", type=str, default=defaults.vlapruner_action_attention_layer_start)
+    parser.add_argument("--vlapruner_calibrate_average_keep", type=parse_bool, default=defaults.vlapruner_calibrate_average_keep)
+    parser.add_argument("--vlapruner_measured_skip_initial_calls", type=int, default=defaults.vlapruner_measured_skip_initial_calls)
+    parser.add_argument("--vlapruner_average_target_measured_steps", type=int, default=defaults.vlapruner_average_target_measured_steps)
+    parser.add_argument("--vlapruner_debug", type=parse_bool, default=defaults.vlapruner_debug)
+    parser.add_argument("--enable_vlaadp", type=parse_bool, default=defaults.enable_vlaadp)
+    parser.add_argument("--vlaadp_keep_visual_tokens", type=int, default=defaults.vlaadp_keep_visual_tokens)
+    parser.add_argument("--vlaadp_visual_tokens", type=int, default=defaults.vlaadp_visual_tokens)
+    parser.add_argument("--vlaadp_num_views", type=int, default=defaults.vlaadp_num_views)
+    parser.add_argument("--vlaadp_qk_layer", type=int, default=defaults.vlaadp_qk_layer)
+    parser.add_argument("--vlaadp_main_view_weight", type=float, default=defaults.vlaadp_main_view_weight)
+    parser.add_argument("--vlaadp_wrist_view_weight", type=float, default=defaults.vlaadp_wrist_view_weight)
+    parser.add_argument("--vlaadp_chunk_size", type=int, default=defaults.vlaadp_chunk_size)
+    parser.add_argument("--vlaadp_cold_start_windows", type=int, default=defaults.vlaadp_cold_start_windows)
+    parser.add_argument("--vlaadp_decision_method", type=str, default=defaults.vlaadp_decision_method)
+    parser.add_argument("--vlaadp_delta_method", type=str, default=defaults.vlaadp_delta_method)
+    parser.add_argument("--vlaadp_adjacent_extrema_window", type=int, default=defaults.vlaadp_adjacent_extrema_window)
+    parser.add_argument("--vlaadp_adjacent_last_state", type=parse_bool, default=defaults.vlaadp_adjacent_last_state)
+    parser.add_argument(
+        "--vlaadp_limit_consecutive_pruned_enabled",
+        type=parse_bool,
+        default=defaults.vlaadp_limit_consecutive_pruned_enabled,
+    )
+    parser.add_argument("--vlaadp_limit_max_consecutive_pruned", type=int, default=defaults.vlaadp_limit_max_consecutive_pruned)
+    parser.add_argument("--vlaadp_min_keep_per_view", type=int, default=defaults.vlaadp_min_keep_per_view)
+    parser.add_argument("--vlaadp_debug", type=parse_bool, default=defaults.vlaadp_debug)
     parser.add_argument("--run_id_note", type=str, default=defaults.run_id_note)
     parser.add_argument("--local_log_dir", type=str, default=defaults.local_log_dir)
     parser.add_argument("--latency_csv_filename", type=str, default=defaults.latency_csv_filename)

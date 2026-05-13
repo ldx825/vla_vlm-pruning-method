@@ -21,19 +21,18 @@ import tqdm
 from libero.libero import benchmark
 ##autoprune
 sys.path.append(os.getcwd())
-sys.path.append(str(Path(__file__).resolve().parent))
+from autoprune_patch_improved_1 import AutoPrunePatchImproved as AutoPrunePatchLegacy
+from vlapruner_oft_patch import VLAPrunerOFTConfig, VLAPrunerOFTPatch
+from vlaadp_oft_patch import VLAADPOFTConfig, VLAADPOFTPatch
 try:
     from autoprune_patch_improved import AutoPrunePatchImproved as AutoPrunePatchModern
 except Exception:
-    AutoPrunePatchModern = None
-from autoprune_patch_improved_1 import AutoPrunePatchImproved as AutoPrunePatchLegacy
+    AutoPrunePatchModern = AutoPrunePatchLegacy
 try:
     from compare_pruning_patch import ComparePruningConfig, ComparePruningPatch
 except Exception:
     ComparePruningConfig = None
     ComparePruningPatch = None
-from fastv_patch import FastVConfig, maybe_apply_fastv_patch
-from sparsevlm_patch import SparseVLMConfig, maybe_apply_sparsevlm_patch
 import wandb
 import time
 
@@ -176,28 +175,40 @@ class GenerateConfig:
     compare_patch_scope: str = "full"                # full / vision_only / regression_only / passthrough
 
     #################################################################################################################
-    # FastV baseline (Chen et al. 2024)
+    # VLA-Pruner on OpenVLA-OFT (unified visual token pool, no per-view allocation)
     #################################################################################################################
-    use_fastv_pruning: bool = False                  # Whether to enable standalone FastV pruning
-    fastv_keep_visual_tokens: int = 128              # Final kept visual tokens; R is derived internally
-    fastv_visual_tokens: int = 512                   # Unified visual token pool across all views
-    fastv_pruning_layer: int = 2                     # K in FastV, 1-based: prune after this layer
-    fastv_debug: bool = False                        # Extra debug prints from the patch
+    use_vlapruner_oft: bool = False                  # Enable VLA-Pruner adapted to OpenVLA-OFT
+    vlapruner_keep_visual_tokens: int = 224          # Target average final visual tokens, not pruning ratio
+    vlapruner_pruning_layer: int = 3                 # Paper K; 1-based layer, prune after this layer
+    vlapruner_temporal_window: int = 3               # Paper temporal window w
+    vlapruner_temporal_gamma: float = 0.8            # Paper temporal decay gamma
+    vlapruner_warmup_steps: int = 3                  # Warm-start steps before pruning
+    vlapruner_action_attention_layer_start: str = "half"  # "half" or 0-based layer index
 
     #################################################################################################################
-    # SparseVLM baseline (Zhang et al. 2025)
+    # VLA-ADP on OpenVLA-OFT (pre-LLM QK pruning, per-view 4:6 main/wrist allocation)
     #################################################################################################################
-    use_sparsevlm_pruning: bool = False              # Whether to enable standalone SparseVLM pruning
-    sparsevlm_target_visual_tokens: int = 128        # Budget projection target for final visual tokens
-    sparsevlm_visual_tokens: int = 512               # Unified visual token pool across all views
-    sparsevlm_pruning_start_layer: int = 1           # 1-based layer where progressive sparsification starts
-    sparsevlm_lambda: float = 1.0                    # Deletion pressure from redundancy signal
-    sparsevlm_recycle_top_ratio: float = 0.5         # Fraction of deleted tokens eligible for rescue
-    sparsevlm_cluster_ratio: float = 0.25            # Number of clusters as a fraction of rescued tokens
-    sparsevlm_rank_tolerance: float = 1e-4           # Numerical threshold for effective-rank SVD
-    sparsevlm_knn_k: int = 8                         # k-NN size for density-peak clustering
-    sparsevlm_min_prune_tokens: int = 1              # Minimum progress per pruning layer while above target
-    sparsevlm_debug: bool = False                    # Extra debug prints from the patch
+    use_vlaadp_oft: bool = False                    # Enable VLA-ADP adapted to OpenVLA-OFT
+    vlaadp_keep_visual_tokens: int = 224            # Total visual tokens kept across all views
+    vlaadp_qk_layer: int = 0                        # Paper default: use layer-0 Q/K before LLM forward
+    vlaadp_main_view_weight: float = 0.4            # Paper multi-view split: main camera share
+    vlaadp_wrist_view_weight: float = 0.6           # Paper multi-view split: wrist camera share
+    vlaadp_use_dynamic_visual_strategy: bool = True # Use previous action trajectory to gate pruning
+    vlaadp_decision_method: str = "adjacent"        # adjacent / avg
+    vlaadp_adjacent_variant: str = "extrema"        # Kept for compatibility with ADP config wording
+    vlaadp_adjacent_extrema_window: int = 3         # Compare current window delta with previous extrema
+    vlaadp_adjacent_lookback: int = 2               # Compatibility knob; extrema_window-1 is used by default
+    vlaadp_adjacent_last_state: bool = True         # Paper Eq. 18: middle band keeps previous state
+    vlaadp_initial_state: int = 0                   # 0 = full visual, 1 = prune
+    vlaadp_delta_method: str = "net"                # net / sum
+    vlaadp_min_delta_pos: float = 0.0
+    vlaadp_min_delta_rot: float = 0.0
+    vlaadp_hysteresis_up: float = 0.0
+    vlaadp_hysteresis_down: float = 0.0
+    vlaadp_tol_equal: float = 0.0
+    vlaadp_cold_start_windows: int = 2              # First two action windows keep full visual tokens
+    vlaadp_limit_consecutive_pruned_enabled: bool = True
+    vlaadp_limit_max_consecutive_pruned: int = 3    # Force full vision after 3 consecutive pruned windows
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -243,6 +254,7 @@ def validate_config(cfg: GenerateConfig) -> None:
         if cfg.budget_mode == "legacy":
             assert cfg.target_token_num > 0, "target_token_num must be positive in legacy budget mode!"
     if cfg.use_compare_pruning:
+        assert ComparePruningConfig is not None and ComparePruningPatch is not None, "compare_pruning_patch.py is not available!"
         assert cfg.compare_visual_token_num > 0, "compare_visual_token_num must be positive!"
         if cfg.compare_pruning_method == "fastv":
             assert cfg.compare_fastv_pruning_layer > 0, "compare_fastv_pruning_layer must be positive for FastV!"
@@ -252,19 +264,22 @@ def validate_config(cfg: GenerateConfig) -> None:
             assert cfg.compare_sparsevlm_recycle_top_ratio >= 0.0, "compare_sparsevlm_recycle_top_ratio must be non-negative!"
             assert cfg.compare_sparsevlm_cluster_ratio >= 0.0, "compare_sparsevlm_cluster_ratio must be non-negative!"
             assert cfg.compare_sparsevlm_knn_k > 0, "compare_sparsevlm_knn_k must be positive!"
-    if cfg.use_fastv_pruning:
-        assert cfg.fastv_keep_visual_tokens > 0, "fastv_keep_visual_tokens must be positive!"
-        assert cfg.fastv_visual_tokens > 0, "fastv_visual_tokens must be positive!"
-        assert cfg.fastv_pruning_layer > 0, "fastv_pruning_layer K must be positive!"
-    if cfg.use_sparsevlm_pruning:
-        assert cfg.sparsevlm_target_visual_tokens > 0, "sparsevlm_target_visual_tokens must be positive!"
-        assert cfg.sparsevlm_visual_tokens > 0, "sparsevlm_visual_tokens must be positive!"
-        assert cfg.sparsevlm_pruning_start_layer > 0, "sparsevlm_pruning_start_layer must be positive!"
-        assert cfg.sparsevlm_lambda >= 0.0, "sparsevlm_lambda must be non-negative!"
-        assert 0.0 <= cfg.sparsevlm_recycle_top_ratio <= 1.0, "sparsevlm_recycle_top_ratio must be in [0, 1]!"
-        assert 0.0 <= cfg.sparsevlm_cluster_ratio <= 1.0, "sparsevlm_cluster_ratio must be in [0, 1]!"
-        assert cfg.sparsevlm_rank_tolerance >= 0.0, "sparsevlm_rank_tolerance must be non-negative!"
-        assert cfg.sparsevlm_knn_k > 0, "sparsevlm_knn_k must be positive!"
+    if cfg.use_vlapruner_oft:
+        assert cfg.visual_tokens > 0, "visual_tokens must be positive for VLA-Pruner-OFT!"
+        assert 0 < cfg.vlapruner_keep_visual_tokens <= cfg.visual_tokens, (
+            "vlapruner_keep_visual_tokens must be in (0, visual_tokens]."
+        )
+        assert cfg.vlapruner_pruning_layer > 0, "vlapruner_pruning_layer is 1-based and must be positive!"
+        assert cfg.vlapruner_temporal_window > 0, "vlapruner_temporal_window must be positive!"
+    if cfg.use_vlaadp_oft:
+        assert cfg.visual_tokens > 0, "visual_tokens must be positive for VLA-ADP-OFT!"
+        assert 0 < cfg.vlaadp_keep_visual_tokens <= cfg.visual_tokens, (
+            "vlaadp_keep_visual_tokens must be in (0, visual_tokens]."
+        )
+        assert cfg.num_images_in_input > 0, "num_images_in_input must be positive for VLA-ADP-OFT!"
+        assert cfg.vlaadp_qk_layer >= 0, "vlaadp_qk_layer must be non-negative!"
+        assert cfg.vlaadp_cold_start_windows >= 0, "vlaadp_cold_start_windows must be non-negative!"
+        assert cfg.vlaadp_limit_max_consecutive_pruned > 0, "vlaadp_limit_max_consecutive_pruned must be positive!"
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -433,6 +448,14 @@ def run_episode(
     """Run a single episode in the environment."""
     # Reset environment
     env.reset()
+    max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
+    average_budget_horizon_steps = int(np.ceil(float(max_steps) / max(1, int(cfg.num_open_loop_steps))))
+    vlapruner_ref = getattr(model, "_vlapruner_patch_ref", None)
+    if vlapruner_ref is not None and hasattr(vlapruner_ref, "reset_episode_history"):
+        vlapruner_ref.reset_episode_history(average_budget_horizon_steps=average_budget_horizon_steps)
+    vlaadp_ref = getattr(model, "_vlaadp_patch_ref", None)
+    if vlaadp_ref is not None and hasattr(vlaadp_ref, "reset_episode_history"):
+        vlaadp_ref.reset_episode_history(average_budget_horizon_steps=average_budget_horizon_steps)
 
     # Set initial state if provided
     if initial_state is not None:
@@ -450,7 +473,6 @@ def run_episode(
     # Setup
     t = 0
     replay_images = []
-    max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
 
     # Run episode
     success = False
@@ -468,6 +490,12 @@ def run_episode(
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
+                if vlaadp_ref is not None and hasattr(vlaadp_ref, "observe_trajectory_step"):
+                    try:
+                        vlaadp_ref.observe_trajectory_step(obs["robot0_eef_pos"], obs["robot0_eef_quat"])
+                    except Exception:
+                        pass
+
                 # Query model to get action
                 # [LATENCY] Start Timer
                 t0_inf = time.perf_counter()
@@ -496,9 +524,9 @@ def run_episode(
                 if patch_ref is None:
                     patch_ref = getattr(model, "_compare_patch_ref", None)
                 if patch_ref is None:
-                    patch_ref = getattr(model, "_fastv_patch_ref", None)
+                    patch_ref = getattr(model, "_vlapruner_patch_ref", None)
                 if patch_ref is None:
-                    patch_ref = getattr(model, "_sparsevlm_patch_ref", None)
+                    patch_ref = getattr(model, "_vlaadp_patch_ref", None)
                 if patch_ref is not None:
                     stats = dict(getattr(patch_ref, "latest_stats", {}) or {})
                     keep_count_schedule = stats.get("keep_count_schedule") or []
@@ -578,6 +606,16 @@ def run_episode(
 
             # Execute action in environment
             obs, reward, done, info = env.step(action.tolist())
+            if vlaadp_ref is not None and hasattr(vlaadp_ref, "observe_trajectory_step"):
+                try:
+                    vlaadp_ref.observe_trajectory_step(obs["robot0_eef_pos"], obs["robot0_eef_quat"])
+                except Exception:
+                    pass
+            if vlaadp_ref is not None and len(action_queue) == 0 and hasattr(vlaadp_ref, "close_action_window"):
+                try:
+                    vlaadp_ref.close_action_window()
+                except Exception:
+                    pass
             if done:
                 success = True
                 break
@@ -719,17 +757,17 @@ def eval_libero(cfg: GenerateConfig) -> float:
     # ===============================================================================
     ENABLE_AUTOPRUNE = cfg.use_auto_prune
     ENABLE_COMPARE_PRUNING = cfg.use_compare_pruning
-    ENABLE_FASTV_PRUNING = cfg.use_fastv_pruning
-    ENABLE_SPARSEVLM_PRUNING = cfg.use_sparsevlm_pruning
+    ENABLE_VLAPRUNER_OFT = cfg.use_vlapruner_oft
+    ENABLE_VLAADP_OFT = cfg.use_vlaadp_oft
 
     enabled_pruners = (
-        int(bool(ENABLE_AUTOPRUNE))
-        + int(bool(ENABLE_COMPARE_PRUNING))
-        + int(bool(ENABLE_FASTV_PRUNING))
-        + int(bool(ENABLE_SPARSEVLM_PRUNING))
+        int(ENABLE_AUTOPRUNE)
+        + int(ENABLE_COMPARE_PRUNING)
+        + int(ENABLE_VLAPRUNER_OFT)
+        + int(ENABLE_VLAADP_OFT)
     )
     if enabled_pruners > 1:
-        raise ValueError("Please enable only one of AutoPrune, compare pruning baselines, FastV, or SparseVLM.")
+        raise ValueError("Please enable only one pruning method: AutoPrune, compare pruning, VLA-Pruner-OFT, or VLA-ADP-OFT.")
 
     if ENABLE_AUTOPRUNE:
         print("\n" + "="*40)
@@ -768,8 +806,6 @@ def eval_libero(cfg: GenerateConfig) -> float:
             
             try:
                 patch_cls = AutoPrunePatchLegacy if cfg.autoprune_patch_variant == "legacy_budget" else AutoPrunePatchModern
-                if patch_cls is None:
-                    raise RuntimeError("Requested modern AutoPrune patch, but autoprune_patch_improved.py was not found.")
                 patcher = patch_cls(
                     model=model,    # 传入顶层 OpenVLA 模型，内部再定位并 patch Llama 层与动作预测入口
                     target_token_num=cfg.target_token_num,
@@ -799,16 +835,77 @@ def eval_libero(cfg: GenerateConfig) -> float:
                 print("✅ AutoPrune successfully patched!")
             except Exception as e:
                 print(f"❌ Failed to apply AutoPrune: {e}")
-                import traceback
-                traceback.print_exc()
+            import traceback
+            traceback.print_exc()
+
+    if ENABLE_VLAPRUNER_OFT:
+        print("\n" + "="*40)
+        print("✂️  Activating VLA-Pruner-OFT (unified visual token pool)...")
+        print("="*40 + "\n")
+        try:
+            vlapruner_cfg = VLAPrunerOFTConfig(
+                enabled=True,
+                keep_visual_tokens=cfg.vlapruner_keep_visual_tokens,
+                visual_tokens=cfg.visual_tokens,
+                pruning_layer=cfg.vlapruner_pruning_layer,
+                temporal_window=cfg.vlapruner_temporal_window,
+                temporal_gamma=cfg.vlapruner_temporal_gamma,
+                warmup_steps=cfg.vlapruner_warmup_steps,
+                action_attention_layer_start=cfg.vlapruner_action_attention_layer_start,
+            )
+            vlapruner_patcher = VLAPrunerOFTPatch(model=model, config=vlapruner_cfg)
+            vlapruner_patcher.apply()
+            setattr(model, "_vlapruner_patch_ref", vlapruner_patcher)
+            print("✅ VLA-Pruner-OFT successfully patched!")
+        except Exception as e:
+            print(f"❌ Failed to apply VLA-Pruner-OFT: {e}")
+            import traceback
+            traceback.print_exc()
+
+    if ENABLE_VLAADP_OFT:
+        print("\n" + "="*40)
+        print("✂️  Activating VLA-ADP-OFT (pre-LLM per-view QK pruning)...")
+        print("="*40 + "\n")
+        try:
+            vlaadp_cfg = VLAADPOFTConfig(
+                enabled=True,
+                keep_visual_tokens=cfg.vlaadp_keep_visual_tokens,
+                visual_tokens=cfg.visual_tokens,
+                num_images_in_input=cfg.num_images_in_input,
+                qk_layer=cfg.vlaadp_qk_layer,
+                main_view_weight=cfg.vlaadp_main_view_weight,
+                wrist_view_weight=cfg.vlaadp_wrist_view_weight,
+                use_dynamic_visual_strategy=cfg.vlaadp_use_dynamic_visual_strategy,
+                decision_method=cfg.vlaadp_decision_method,
+                adjacent_variant=cfg.vlaadp_adjacent_variant,
+                adjacent_extrema_window=cfg.vlaadp_adjacent_extrema_window,
+                adjacent_lookback=cfg.vlaadp_adjacent_lookback,
+                adjacent_last_state=cfg.vlaadp_adjacent_last_state,
+                initial_state=cfg.vlaadp_initial_state,
+                delta_method=cfg.vlaadp_delta_method,
+                min_delta_pos=cfg.vlaadp_min_delta_pos,
+                min_delta_rot=cfg.vlaadp_min_delta_rot,
+                hysteresis_up=cfg.vlaadp_hysteresis_up,
+                hysteresis_down=cfg.vlaadp_hysteresis_down,
+                tol_equal=cfg.vlaadp_tol_equal,
+                cold_start_windows=cfg.vlaadp_cold_start_windows,
+                limit_consecutive_pruned_enabled=cfg.vlaadp_limit_consecutive_pruned_enabled,
+                limit_max_consecutive_pruned=cfg.vlaadp_limit_max_consecutive_pruned,
+            )
+            vlaadp_patcher = VLAADPOFTPatch(model=model, config=vlaadp_cfg)
+            vlaadp_patcher.apply()
+            setattr(model, "_vlaadp_patch_ref", vlaadp_patcher)
+            print("✅ VLA-ADP-OFT successfully patched!")
+        except Exception as e:
+            print(f"❌ Failed to apply VLA-ADP-OFT: {e}")
+            import traceback
+            traceback.print_exc()
 
     if ENABLE_COMPARE_PRUNING:
         print("\n" + "="*40)
         print(f"🧪 Activating compare pruning baseline: {cfg.compare_pruning_method}")
         print("="*40 + "\n")
         try:
-            if ComparePruningConfig is None or ComparePruningPatch is None:
-                raise RuntimeError("compare_pruning_patch.py was not found in this OpenVLA-OFT method directory.")
             compare_cfg = ComparePruningConfig(
                 method=cfg.compare_pruning_method,
                 visual_token_num=cfg.compare_visual_token_num,
@@ -833,57 +930,6 @@ def eval_libero(cfg: GenerateConfig) -> float:
             print("✅ Compare pruning baseline successfully patched!")
         except Exception as e:
             print(f"❌ Failed to apply compare pruning baseline: {e}")
-            import traceback
-            traceback.print_exc()
-
-    if ENABLE_FASTV_PRUNING:
-        print("\n" + "="*40)
-        print("⚡ Activating FastV baseline (standalone unified visual pool)...")
-        print("="*40 + "\n")
-        try:
-            fastv_cfg = FastVConfig(
-                enabled=True,
-                keep_visual_tokens=cfg.fastv_keep_visual_tokens,
-                visual_tokens=cfg.fastv_visual_tokens,
-                pruning_layer=cfg.fastv_pruning_layer,
-                debug=cfg.fastv_debug,
-            )
-            fastv_patcher = maybe_apply_fastv_patch(model=model, config=fastv_cfg)
-            setattr(model, "_fastv_patch_ref", fastv_patcher)
-            # Reuse the existing stats collection path in rollout(); it first
-            # checks AutoPrune/compare refs, so expose FastV through the same
-            # shape while keeping the dedicated ref for clarity.
-            setattr(model, "_compare_patch_ref", fastv_patcher)
-            print("✅ FastV successfully patched!")
-        except Exception as e:
-            print(f"❌ Failed to apply FastV: {e}")
-            import traceback
-            traceback.print_exc()
-
-    if ENABLE_SPARSEVLM_PRUNING:
-        print("\n" + "="*40)
-        print("🪶 Activating SparseVLM baseline (standalone unified visual pool)...")
-        print("="*40 + "\n")
-        try:
-            sparsevlm_cfg = SparseVLMConfig(
-                enabled=True,
-                target_visual_tokens=cfg.sparsevlm_target_visual_tokens,
-                visual_tokens=cfg.sparsevlm_visual_tokens,
-                pruning_start_layer=cfg.sparsevlm_pruning_start_layer,
-                lambda_scale=cfg.sparsevlm_lambda,
-                recycle_top_ratio=cfg.sparsevlm_recycle_top_ratio,
-                cluster_ratio=cfg.sparsevlm_cluster_ratio,
-                rank_tolerance=cfg.sparsevlm_rank_tolerance,
-                knn_k=cfg.sparsevlm_knn_k,
-                min_prune_tokens=cfg.sparsevlm_min_prune_tokens,
-                debug=cfg.sparsevlm_debug,
-            )
-            sparsevlm_patcher = maybe_apply_sparsevlm_patch(model=model, config=sparsevlm_cfg)
-            setattr(model, "_sparsevlm_patch_ref", sparsevlm_patcher)
-            setattr(model, "_compare_patch_ref", sparsevlm_patcher)
-            print("✅ SparseVLM successfully patched!")
-        except Exception as e:
-            print(f"❌ Failed to apply SparseVLM: {e}")
             import traceback
             traceback.print_exc()
             

@@ -7,13 +7,15 @@ import types
 import os
 from scipy.fftpack import idct
 from safetensors.torch import load_file as safetensors_load_file
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, GenerationConfig, StoppingCriteria, StoppingCriteriaList
+from transformers import AutoProcessor, PreTrainedTokenizerFast, Qwen2_5_VLForConditionalGeneration, GenerationConfig, StoppingCriteria, StoppingCriteriaList
 from typing import Optional, Union, Dict, Any, List, Tuple, Callable
 from qwen_vl_utils import process_vision_info
 from huggingface_hub import hf_hub_download
 import json
 from autoprune_nora import NoraAutoPruneConfig, NoraAutoPrunePatch
 from compare_pruning_patch_nora import NoraComparePruningConfig, NoraComparePruningPatch
+from vlapruner_nora import NoraVLAPrunerConfig, NoraVLAPrunerPatch
+from vlaadp_nora import NoraVLAADPConfig, NoraVLAADPPatch
 
 
 def has_flash_attn() -> bool:
@@ -112,6 +114,8 @@ class Nora:
         use_anyres: bool = False,
         autoprune_config: Optional[NoraAutoPruneConfig] = None,
         compare_pruning_config: Optional[NoraComparePruningConfig] = None,
+        vlapruner_config: Optional[NoraVLAPrunerConfig] = None,
+        vlaadp_config: Optional[NoraVLAADPConfig] = None,
         force_attn_implementation: Optional[str] = None,
         force_output_attentions: bool = False,
         enable_stage_profiling: bool = True,
@@ -245,23 +249,83 @@ class Nora:
                   raise RuntimeError(f"CUDA device {gpu_id} not available. Only {torch.cuda.device_count()} devices found.")
 
         # --- Load Fast Tokenizer ---
-        try:
-            print(f"Loading fast tokenizer from: physical-intelligence/fast")
-            self.fast_tokenizer = AutoProcessor.from_pretrained(
-                "physical-intelligence/fast", trust_remote_code=True
-            )
-            # Ensure required attributes are set/exist
-           
-            self.fast_tokenizer.action_dim = 7 # Set default if not in config
-            print("Setting action_dim  to 7.")
-           
-            self.fast_tokenizer.time_horizon = 1 # Set default if not in config
-            print("Setting time horizon to 1.")
+        fast_tokenizer_sources = [
+            "physical-intelligence/fast",
+            "/tmp/physical_intelligence_fast_ec4d7aa71691cac0b8bed6942be45684db2110f4",
+            "/mnt/jarvis/migration/.cache/nora/.hf/hub/models--physical-intelligence--fast/snapshots/ec4d7aa71691cac0b8bed6942be45684db2110f4",
+            "/mnt/jarvis/.hf/hub/models--physical-intelligence--fast/snapshots/ec4d7aa71691cac0b8bed6942be45684db2110f4",
+        ]
+        fast_tokenizer_errors = []
+        self.fast_tokenizer = None
+        for fast_tokenizer_source in fast_tokenizer_sources:
+            try:
+                print(f"Loading fast tokenizer from: {fast_tokenizer_source}")
+                self.fast_tokenizer = AutoProcessor.from_pretrained(
+                    fast_tokenizer_source, trust_remote_code=True
+                )
+                break
+            except Exception as e:
+                fast_tokenizer_errors.append(f"{fast_tokenizer_source}: {e}")
 
-        except Exception as e:
+        if self.fast_tokenizer is None:
+            manual_fast_tokenizer_sources = [
+                source for source in fast_tokenizer_sources if os.path.isdir(source)
+            ]
+            for fast_tokenizer_source in manual_fast_tokenizer_sources:
+                try:
+                    print(f"Loading fast tokenizer via manual fallback from: {fast_tokenizer_source}")
+                    processor_config_path = os.path.join(fast_tokenizer_source, "processor_config.json")
+                    tokenizer_json_path = os.path.join(fast_tokenizer_source, "tokenizer.json")
+                    processor_module_path = os.path.join(fast_tokenizer_source, "processing_action_tokenizer.py")
+                    if not (
+                        os.path.isfile(processor_config_path)
+                        and os.path.isfile(tokenizer_json_path)
+                        and os.path.isfile(processor_module_path)
+                    ):
+                        raise FileNotFoundError(
+                            f"Missing one of processor_config.json/tokenizer.json/processing_action_tokenizer.py under {fast_tokenizer_source}"
+                        )
+
+                    with open(processor_config_path, "r", encoding="utf-8") as f:
+                        processor_config = json.load(f)
+
+                    spec = importlib.util.spec_from_file_location(
+                        "nora_fast_action_processor_fallback", processor_module_path
+                    )
+                    if spec is None or spec.loader is None:
+                        raise ImportError(f"Unable to load module spec from {processor_module_path}")
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+
+                    processor_cls_name = processor_config.get("processor_class", "UniversalActionProcessor")
+                    processor_cls = getattr(module, processor_cls_name)
+                    bpe_tokenizer = PreTrainedTokenizerFast(
+                        tokenizer_file=tokenizer_json_path, clean_up_tokenization_spaces=False
+                    )
+                    self.fast_tokenizer = processor_cls(
+                        bpe_tokenizer=bpe_tokenizer,
+                        scale=processor_config.get("scale", 10),
+                        vocab_size=processor_config.get("vocab_size", 1024),
+                        min_token=processor_config.get("min_token", 0),
+                        action_dim=processor_config.get("action_dim"),
+                        time_horizon=processor_config.get("time_horizon"),
+                    )
+                    break
+                except Exception as e:
+                    fast_tokenizer_errors.append(f"manual:{fast_tokenizer_source}: {e}")
+
+        if self.fast_tokenizer is None:
             raise RuntimeError(
-                f"Error loading fast tokenizer: {e}. "
+                "Error loading fast tokenizer. Tried: "
+                + " | ".join(fast_tokenizer_errors)
             )
+
+        # Ensure required attributes are set/exist
+        self.fast_tokenizer.action_dim = 7 # Set default if not in config
+        print("Setting action_dim  to 7.")
+
+        self.fast_tokenizer.time_horizon = 1 # Set default if not in config
+        print("Setting time horizon to 1.")
 
         # --- Load Main Processor ---
         try:
@@ -315,6 +379,14 @@ class Nora:
                 else:
                     # If the pruning path depends on model-returned attentions, Qwen needs eager.
                     attn_implementation = "eager"
+            elif attn_implementation is None and vlapruner_config is not None and vlapruner_config.enabled:
+                # VLA-Pruner needs prefill attentions for semantic scores and
+                # decode attentions for action-to-vision history, so use eager.
+                attn_implementation = "eager"
+            elif attn_implementation is None and vlaadp_config is not None and vlaadp_config.enabled:
+                # VLA-ADP computes its text-to-vision scores before the LLM
+                # using q/k projection weights, so decoder attentions are not required.
+                attn_implementation = "flash_attention_2" if flash_attn_available else "sdpa"
 
             if attn_implementation == "flash_attention_2" and not flash_attn_available:
                 fallback_impl = "sdpa"
@@ -374,12 +446,27 @@ class Nora:
                     "Compare pruning baseline enabled for inference (NORA): "
                     f"{compare_pruning_config.method}"
                 )
+            elif vlapruner_config is not None and vlapruner_config.enabled:
+                self.autoprune_patch = NoraVLAPrunerPatch(self.model, vlapruner_config)
+                self.autoprune_patch.apply()
+                self.model.config.use_cache = True
+                self.model.generation_config.use_cache = True
+                print("VLA-Pruner enabled for inference (NORA).")
+            elif vlaadp_config is not None and vlaadp_config.enabled:
+                self.autoprune_patch = NoraVLAADPPatch(self.model, vlaadp_config)
+                self.autoprune_patch.apply()
+                self.model.config.use_cache = True
+                self.model.generation_config.use_cache = True
+                print("VLA-ADP enabled for inference (NORA).")
 
             self.model.to(self.device)
             # Load generation config and set specific parameters
             self.model.generation_config = GenerationConfig.from_pretrained(model_path)
             self.model.generation_config.do_sample = False # Ensure deterministic output
-            if compare_pruning_config is not None and compare_pruning_config.enabled:
+            if (
+                (compare_pruning_config is not None and compare_pruning_config.enabled)
+                or (vlaadp_config is not None and vlaadp_config.enabled)
+            ):
                 self.model.generation_config.use_cache = True
 
             self.model.eval() # Set the model to evaluation mode
@@ -625,6 +712,9 @@ class Nora:
         if should_compress_prefill:
             generate_kwargs = self.autoprune_patch.compress_generate_inputs(self.model, generate_kwargs)
 
+        if self.autoprune_patch is not None and hasattr(self.autoprune_patch, "begin_generate"):
+            self.autoprune_patch.begin_generate()
+
         try:
             generated = self.model.generate(**generate_kwargs)
         finally:
@@ -654,6 +744,10 @@ class Nora:
         decode_t0 = time.perf_counter()
         prompt_source_ids = generate_kwargs.get("input_ids", inputs.get("input_ids"))
         prompt_token_count = int(prompt_source_ids.shape[1]) if prompt_source_ids is not None else 0
+        if self.autoprune_patch is not None and hasattr(self.autoprune_patch, "finish_decode_step"):
+            self.autoprune_patch.finish_decode_step()
+        if self.autoprune_patch is not None and hasattr(self.autoprune_patch, "finalize_action_attention_from_generation"):
+            self.autoprune_patch.finalize_action_attention_from_generation(generated_ids, prompt_token_count)
         generated_token_count = max(int(generated_ids.shape[1]) - prompt_token_count, 0)
         action_token_count = self._count_action_tokens(generated_ids)
         decode_to_action_ratio = float(generated_token_count / max(action_token_count, 1))

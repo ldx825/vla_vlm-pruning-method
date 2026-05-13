@@ -16,6 +16,9 @@ htmlcov/
 
 # Environments
 .venv/
+**/.venv/
+.uvenv/
+**/.uvenv/
 venv/
 env/
 miniconda3/
@@ -62,7 +65,10 @@ pretrained/
 tensorboard/
 events.out.tfevents*
 nohup.out
+*.out
+*.err
 *.log
+*.log.*
 *.mp4
 *.avi
 *.mov
@@ -83,6 +89,16 @@ temp/
 *.tar.gz
 *.tgz
 *.7z
+
+# Local runtime caches created by LIBERO/OpenVLA/NORA launch scripts
+**/.hf_home*/
+**/.hf_modules_cache*/
+**/.huggingface*/
+**/.cache/
+**/.mplconfig*/
+**/.libero_config*/
+**/LIBERO/
+debugpy*.log
 
 # System files
 .DS_Store

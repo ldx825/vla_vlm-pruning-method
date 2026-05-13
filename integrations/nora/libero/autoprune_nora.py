@@ -397,6 +397,7 @@ class NoraAutoPrunePatch:
         self.layers = self._resolve_layers(model)
         self.original_forwards: Dict[int, Any] = {}
         self.proj_hook_handles: List[Any] = []
+        self.registered_proj_hook_layers: set[int] = set()
         self.proj_cache: Dict[int, Dict[str, torch.Tensor]] = {}
 
         self.keep_percent_schedule = []
@@ -409,6 +410,9 @@ class NoraAutoPrunePatch:
         self.input_layout: Dict[str, Any] = {}
         self.cached_view_score_ids: List[torch.Tensor] = []
         self.cached_view_score_values: List[torch.Tensor] = []
+        self.cached_position_ids = None
+        self.cached_position_embeddings = None
+        self.active_proj_capture_layer: Optional[int] = None
         self.manual_probe_anchor_layers: set[int] = set()
         self.noop_control_mode = False
 
@@ -451,9 +455,14 @@ class NoraAutoPrunePatch:
         self.proj_cache = {}
         self.cached_view_score_ids = []
         self.cached_view_score_values = []
+        self.cached_position_ids = None
+        self.cached_position_embeddings = None
+        self.active_proj_capture_layer = None
+        self.registered_proj_hook_layers = set()
         self.noop_control_mode = False
         self.runtime_stats = {
             "prefill_seq_len": None,
+            "expected_compacted_seq_len": None,
             "schedule_len": 0,
             "nmi_head": None,
             "nmi_wrist": None,
@@ -495,6 +504,12 @@ class NoraAutoPrunePatch:
             "manual_probe_qk_cache_hits": 0,
             "manual_probe_qk_cache_misses": 0,
             "manual_probe_reused_layers": 0,
+            "decode_cache_seq_len_layer0": None,
+            "decode_expected_visual_tokens_layer0": None,
+            "decode_expected_total_seq_len_layer0": None,
+            "final_visual_tokens": None,
+            "decoder_layers_recorded": 0.0,
+            "decoder_layers_missing": 0.0,
         }
 
     def _resolve_manual_probe_anchor_layers(self, x0_override: Optional[float] = None) -> set[int]:
@@ -536,6 +551,19 @@ class NoraAutoPrunePatch:
         max_x0 = float(max(self.pruning_loc[-1], self.config.start_layer))
         return max(min_x0, min(max_x0, x0_eff))
 
+    def _effective_min_keep_for_total_budget(
+        self,
+        view_lengths: List[int],
+        total_budget: int,
+    ) -> int:
+        non_empty_views = sum(1 for length in view_lengths if int(length) > 0)
+        if non_empty_views <= 0:
+            return 0
+        configured_floor = max(1, int(getattr(self.config, "min_keep_per_view", 1) or 1))
+        if int(total_budget) < int(non_empty_views * configured_floor):
+            return 1
+        return configured_floor
+
     def _is_no_prune_budget(self, current_vis_len: int) -> bool:
         if current_vis_len <= 0:
             return True
@@ -550,7 +578,38 @@ class NoraAutoPrunePatch:
         for i, layer in enumerate(self.layers):
             self.original_forwards[i] = layer.forward
             layer.forward = types.MethodType(self._make_new_forward(i), layer)
-            self._register_projection_hooks(i, layer)
+        self._sync_projection_hooks(self._desired_manual_probe_hook_layers())
+
+    def _desired_manual_probe_hook_layers(self) -> set[int]:
+        if not bool(getattr(self.config, "manual_attention_probe", False)):
+            return set()
+        if bool(getattr(self.config, "disable_progressive_prune", False)):
+            return {int(self.config.start_layer)}
+        if bool(getattr(self.config, "prune_only_on_anchor_layers", False)):
+            return set(int(layer_idx) for layer_idx in (self.manual_probe_anchor_layers or {self.config.start_layer}))
+        max_layers = int(getattr(self.config, "manual_attention_probe_max_layers", 0) or 0)
+        if max_layers > 0:
+            return set(int(layer_idx) for layer_idx in (self.manual_probe_anchor_layers or self.pruning_loc))
+        return set(int(layer_idx) for layer_idx in self.pruning_loc)
+
+    def _clear_projection_hooks(self) -> None:
+        for handle in self.proj_hook_handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self.proj_hook_handles = []
+        self.registered_proj_hook_layers = set()
+
+    def _sync_projection_hooks(self, target_layers: set[int]) -> None:
+        target_layers = set(int(layer_idx) for layer_idx in target_layers)
+        if target_layers == self.registered_proj_hook_layers:
+            return
+        self._clear_projection_hooks()
+        for layer_idx in sorted(target_layers):
+            if 0 <= layer_idx < self.num_layers:
+                self._register_projection_hooks(layer_idx, self.layers[layer_idx])
+        self.registered_proj_hook_layers = set(target_layers)
 
     def _register_projection_hooks(self, layer_idx: int, layer: Any) -> None:
         self_attn = getattr(layer, "self_attn", None)
@@ -559,6 +618,12 @@ class NoraAutoPrunePatch:
 
         def make_hook(cache_key: str):
             def hook(_module, _inputs, output):
+                if self.active_proj_capture_layer != layer_idx:
+                    return
+                if not isinstance(output, torch.Tensor) or output.ndim < 3:
+                    return
+                if output.shape[1] <= 96:
+                    return
                 layer_cache = self.proj_cache.setdefault(layer_idx, {})
                 layer_cache[cache_key] = output
             return hook
@@ -1330,6 +1395,81 @@ class NoraAutoPrunePatch:
         return base[keep_mask].view(batch_size, -1)
 
     @staticmethod
+    def _gather_cache_states(cache_states: torch.Tensor, full_indices: torch.Tensor) -> torch.Tensor:
+        if cache_states.ndim != 4:
+            return cache_states
+        batch_size, _, new_len = full_indices.shape[0], cache_states.shape[1], full_indices.shape[1]
+        gather_indices = full_indices.unsqueeze(1).unsqueeze(-1).expand(
+            batch_size,
+            cache_states.shape[1],
+            new_len,
+            cache_states.shape[3],
+        )
+        return cache_states.gather(2, gather_indices).contiguous()
+
+    @staticmethod
+    def _gather_position_ids(position_ids: Optional[torch.Tensor], gather_idx: torch.Tensor) -> Optional[torch.Tensor]:
+        if position_ids is None:
+            return None
+        if position_ids.dim() == 2 and position_ids.shape[1] > gather_idx.shape[1]:
+            return position_ids.gather(1, gather_idx)
+        if position_ids.dim() == 3 and position_ids.shape[2] > gather_idx.shape[1]:
+            expanded = gather_idx.unsqueeze(0).expand(position_ids.shape[0], -1, -1)
+            return position_ids.gather(2, expanded)
+        return position_ids
+
+    @staticmethod
+    def _gather_position_embeddings(
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        gather_idx: torch.Tensor,
+        batch_size: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if position_embeddings is None:
+            return None
+        cos, sin = position_embeddings
+        if cos.dim() == 4 and cos.shape[2] > gather_idx.shape[1]:
+            expanded = gather_idx.unsqueeze(0).unsqueeze(-1).expand(
+                cos.shape[0], batch_size, gather_idx.shape[1], cos.size(-1)
+            )
+            return cos.gather(2, expanded), sin.gather(2, expanded)
+        if cos.dim() == 3 and cos.shape[1] > gather_idx.shape[1]:
+            expanded = gather_idx.unsqueeze(-1).expand(-1, -1, cos.size(-1))
+            return cos.gather(1, expanded), sin.gather(1, expanded)
+        return position_embeddings
+
+    def _compact_past_key_values(
+        self,
+        cache_obj: Any,
+        full_indices: torch.Tensor,
+        upto_layer_idx: int,
+    ) -> int:
+        if cache_obj is None or not hasattr(cache_obj, "key_cache") or not hasattr(cache_obj, "value_cache"):
+            return 0
+
+        compacted_layers = 0
+        max_layer = min(int(upto_layer_idx), len(cache_obj.key_cache) - 1)
+        for cache_layer_idx in range(max_layer + 1):
+            key_states = cache_obj.key_cache[cache_layer_idx]
+            value_states = cache_obj.value_cache[cache_layer_idx]
+            if not isinstance(key_states, torch.Tensor) or not isinstance(value_states, torch.Tensor):
+                continue
+            if key_states.numel() == 0 or value_states.numel() == 0:
+                continue
+            if key_states.shape[-2] <= full_indices.shape[1]:
+                continue
+            cache_obj.key_cache[cache_layer_idx] = self._gather_cache_states(key_states, full_indices)
+            cache_obj.value_cache[cache_layer_idx] = self._gather_cache_states(value_states, full_indices)
+            compacted_layers += 1
+
+        if compacted_layers > 0 and hasattr(cache_obj, "_seen_tokens"):
+            try:
+                cache_obj._seen_tokens = int(full_indices.shape[1])
+            except Exception:
+                pass
+
+        return compacted_layers
+
+    @staticmethod
     def _counts_to_keep_ratios(
         keep_count_schedule: List[List[int]],
         start_h: int,
@@ -1501,73 +1641,117 @@ class NoraAutoPrunePatch:
 
             short_seq_skip = seq_len <= 96
 
+            # Decode / very short sequences never prune. Keep this path as thin as
+            # possible so per-token latency is dominated by the model, not patch
+            # bookkeeping. KV cache compaction is already applied on the long-seq
+            # prefill layer where pruning happens.
+            if short_seq_skip:
+                adapted_position_ids = position_ids
+                adapted_attention_mask = attention_mask
+                adapted_kwargs = dict(kwargs)
+
+                # A compacted prefill can shrink the sequence into the "short"
+                # regime (for example 94 tokens) while the upstream
+                # position_embeddings / position_ids still describe the original
+                # full sequence. Keep the decode fast path untouched for q_len=1,
+                # but realign metadata for compacted short prefills so later
+                # decoder layers do not see 94-vs-552 style shape mismatches.
+                if seq_len > 1 and self.global_indices is not None:
+                    gather_idx = self.global_indices
+                    if gather_idx.shape[0] == 1 and batch_size > 1:
+                        gather_idx = gather_idx.expand(batch_size, -1)
+
+                    if adapted_position_ids is None:
+                        adapted_position_ids = gather_idx
+                    elif self.cached_position_ids is not None:
+                        adapted_position_ids = self.cached_position_ids
+                    else:
+                        adapted_position_ids = self._gather_position_ids(adapted_position_ids, gather_idx)
+
+                    if adapted_attention_mask is not None and adapted_attention_mask.shape[-1] != seq_len:
+                        adapted_attention_mask = None
+
+                    if "position_embeddings" in adapted_kwargs and adapted_kwargs["position_embeddings"] is not None:
+                        try:
+                            if self.cached_position_embeddings is not None:
+                                adapted_kwargs["position_embeddings"] = self.cached_position_embeddings
+                            else:
+                                adapted_kwargs["position_embeddings"] = self._gather_position_embeddings(
+                                    adapted_kwargs["position_embeddings"],
+                                    gather_idx,
+                                    batch_size,
+                                )
+                        except Exception:
+                            pass
+
+                if layer_idx == 0 and kwargs.get("past_key_value", None) is not None:
+                    cache_obj = kwargs.get("past_key_value", None)
+                    cache_seq_len = None
+                    try:
+                        if hasattr(cache_obj, "get_seq_length"):
+                            cache_seq_len = int(cache_obj.get_seq_length(layer_idx))
+                        elif isinstance(cache_obj, (tuple, list)) and len(cache_obj) > layer_idx:
+                            layer_cache = cache_obj[layer_idx]
+                            if isinstance(layer_cache, (tuple, list)) and len(layer_cache) > 0:
+                                cache_seq_len = int(layer_cache[0].shape[-2])
+                    except Exception:
+                        cache_seq_len = None
+
+                    current_h = int(self.view_boundary_tracker.get("current_h", 0) or 0)
+                    current_w = int(self.view_boundary_tracker.get("current_w", 0) or 0)
+                    always_keep = self.input_layout.get("always_keep_positions")
+                    always_keep_count = int(always_keep.numel()) if always_keep is not None else 0
+                    expected_total = int(self.runtime_stats.get("expected_compacted_seq_len") or 0)
+                    if expected_total <= 0:
+                        expected_total = always_keep_count + current_h + current_w
+                    self.runtime_stats["decode_cache_seq_len_layer0"] = cache_seq_len
+                    self.runtime_stats["decode_expected_visual_tokens_layer0"] = int(current_h + current_w)
+                    self.runtime_stats["decode_expected_total_seq_len_layer0"] = int(expected_total)
+
+                outputs = self._run_profiled_original_forward(
+                    layer_idx,
+                    self_layer,
+                    hidden_states,
+                    adapted_attention_mask,
+                    adapted_position_ids,
+                    adapted_kwargs,
+                    stat_prefix="regular_forward",
+                )
+                self._pop_cached_proj_states(layer_idx)
+                return finish(outputs)
+
             if layer_idx == 0 or self.global_indices is None:
                 self.global_indices = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0)
 
+            gather_idx = self.global_indices
+            if gather_idx.shape[0] == 1 and batch_size > 1:
+                gather_idx = gather_idx.expand(batch_size, -1)
+
             # Keep position_ids aligned with pruned hidden_states.
             if position_ids is None:
-                position_ids = self.global_indices
+                position_ids = gather_idx
             else:
-                if position_ids.dim() == 2:
-                    # [B, L]
-                    if position_ids.shape[1] > seq_len:
-                        gather_idx = self.global_indices
-                        if gather_idx.shape[0] == 1 and batch_size > 1:
-                            gather_idx = gather_idx.expand(batch_size, -1)
-                        position_ids = position_ids.gather(1, gather_idx)
-                elif position_ids.dim() == 3:
-                    # Qwen2.5-VL commonly uses [3, B, L]
-                    if position_ids.shape[2] > seq_len:
-                        gather_idx = self.global_indices
-                        if gather_idx.shape[0] == 1 and batch_size > 1:
-                            gather_idx = gather_idx.expand(batch_size, -1)
-                        expanded = gather_idx.unsqueeze(0).expand(position_ids.shape[0], -1, -1)
-                        position_ids = position_ids.gather(2, expanded)
+                if self.cached_position_ids is not None:
+                    position_ids = self.cached_position_ids
+                else:
+                    position_ids = self._gather_position_ids(position_ids, gather_idx)
 
             if attention_mask is not None and attention_mask.shape[-1] != seq_len:
                 attention_mask = None
 
             if "position_embeddings" in kwargs and kwargs["position_embeddings"] is not None:
                 try:
-                    cos, sin = kwargs["position_embeddings"]
-                    # Qwen2.5-VL rotary embeddings are often [3, B, L, D].
-                    if cos.dim() == 4 and cos.shape[2] > seq_len:
-                        gather_idx = self.global_indices
-                        if gather_idx.shape[0] == 1 and batch_size > 1:
-                            gather_idx = gather_idx.expand(batch_size, -1)
-                        expanded = gather_idx.unsqueeze(0).unsqueeze(-1).expand(
-                            cos.shape[0], batch_size, gather_idx.shape[1], cos.size(-1)
+                    if self.cached_position_embeddings is not None:
+                        kwargs["position_embeddings"] = self.cached_position_embeddings
+                    else:
+                        kwargs["position_embeddings"] = self._gather_position_embeddings(
+                            kwargs["position_embeddings"],
+                            gather_idx,
+                            batch_size,
                         )
-                        cos = cos.gather(2, expanded)
-                        sin = sin.gather(2, expanded)
-                        kwargs["position_embeddings"] = (cos, sin)
-                    elif cos.dim() == 3 and cos.shape[1] > seq_len:
-                        # Fallback layout [B, L, D]
-                        gather_idx = self.global_indices
-                        if gather_idx.shape[0] == 1 and batch_size > 1:
-                            gather_idx = gather_idx.expand(batch_size, -1)
-                        cos = cos.gather(1, gather_idx.unsqueeze(-1).expand(-1, -1, cos.size(-1)))
-                        sin = sin.gather(1, gather_idx.unsqueeze(-1).expand(-1, -1, sin.size(-1)))
-                        kwargs["position_embeddings"] = (cos, sin)
                 except Exception:
                     # Keep original position_embeddings when gather adaptation fails.
                     pass
-
-            # During decode / very short sequences, skip pruning but keep aligned ids/rotary tensors.
-            if short_seq_skip:
-                if self.config.debug and layer_idx == self.config.start_layer:
-                    print(f"[AutoPruneDebug] skip at layer {layer_idx}: short_seq={seq_len}")
-                outputs = self._run_profiled_original_forward(
-                    layer_idx,
-                    self_layer,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    kwargs,
-                    stat_prefix="regular_forward",
-                )
-                self._pop_cached_proj_states(layer_idx)
-                return finish(outputs)
 
             # Pure ablation path: directly drop a fixed number of visual tokens at start layer,
             # then keep the shortened sequence for following layers.
@@ -1763,14 +1947,22 @@ class NoraAutoPrunePatch:
                 )
                 return finish(outputs)
 
-            outputs = self._run_profiled_original_forward(
-                layer_idx,
-                self_layer,
-                hidden_states,
-                attention_mask,
-                position_ids,
-                forward_kwargs,
-            )
+            prev_capture_layer = self.active_proj_capture_layer
+            if use_manual_probe and int(hidden_states.shape[1]) > 96:
+                self.active_proj_capture_layer = layer_idx
+            else:
+                self.active_proj_capture_layer = None
+            try:
+                outputs = self._run_profiled_original_forward(
+                    layer_idx,
+                    self_layer,
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    forward_kwargs,
+                )
+            finally:
+                self.active_proj_capture_layer = prev_capture_layer
 
             def clean_outputs(current_outputs):
                 if original_output_attentions or not forced_output_attentions:
@@ -1831,296 +2023,364 @@ class NoraAutoPrunePatch:
                     attn_wrist = attn_queries.index_select(3, view_positions[1])
 
                 detailed_timing = bool(getattr(self.config, "detailed_timing", True))
-                metric_t0 = time.perf_counter() if detailed_timing else None
-
-                def get_metric(view_attn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-                    norm = view_attn / (view_attn.sum(dim=-1, keepdim=True) + 1e-9)
-                    mi_vec, kl_vec = calculate_mi_and_kl(norm[0])
-                    denom = max(1, norm.shape[2])
-                    return mi_vec.sum() / denom, kl_vec.sum() / denom
-
-                mi_h, kl_h = get_metric(attn_head)
-                mi_w, kl_w = get_metric(attn_wrist)
-                nmi_h = _finite_scalar(mi_h / (kl_h + 1e-6), default=1e-6, min_value=1e-6)
-                nmi_w = _finite_scalar(mi_w / (kl_w + 1e-6), default=1e-6, min_value=1e-6)
-                if detailed_timing and metric_t0 is not None:
-                    self.runtime_stats["metric_seconds"] = float(
-                        self.runtime_stats.get("metric_seconds", 0.0) + (time.perf_counter() - metric_t0)
-                    )
-
-                if self.cached_rank is None:
-                    rank_t0 = time.perf_counter() if detailed_timing else None
-                    text_start = int(query_positions[0].item())
-                    self.cached_rank = self._calculate_effective_rank(hidden_states, slice(text_start, seq_len))
-                    if detailed_timing and rank_t0 is not None:
-                        self.runtime_stats["rank_seconds"] = float(
-                            self.runtime_stats.get("rank_seconds", 0.0) + (time.perf_counter() - rank_t0)
-                        )
-
-                schedule_t0 = time.perf_counter() if detailed_timing else None
-                self.cached_rank = _finite_scalar(self.cached_rank, default=1.0, min_value=1.0)
-                nmi_avg = (nmi_h + nmi_w) / 2.0
-                complexity_signal = _finite_scalar(self.cached_rank / torch.clamp(nmi_avg, min=1e-6), default=float(self.config.mu), min_value=1e-6)
-                complexity_score = float(
-                    logistic_complexity_score(
-                        complexity_signal,
-                        getattr(self.config, "adaptive_layer_mu", self.config.mu),
-                        getattr(self.config, "adaptive_layer_tau", self.config.tau),
-                    ).item()
+                fixed_single_shot_fast_path = (
+                    bool(self.config.disable_progressive_prune)
+                    and not bool(self.config.monitor_only)
+                    and not bool(self.config.disable_token_prune)
+                    and int(getattr(self.config, "b_min", 0) or 0) > 0
+                    and int(getattr(self.config, "b_min", 0) or 0) == int(getattr(self.config, "b_max", 0) or 0)
                 )
 
-                kl_tensor = torch.stack([
-                    _finite_scalar(kl_h, default=0.0, min_value=0.0),
-                    _finite_scalar(kl_w, default=0.0, min_value=0.0),
-                ])
-                budget_mode = str(getattr(self.config, "budget_mode", "absolute") or "absolute").lower()
-                absolute_anchor_mode = str(getattr(self.config, "absolute_anchor_mode", "none") or "none").lower()
-                configured_visual_budget_cap = int(self.config.target_token_num) if int(self.config.target_token_num) > 0 else None
-                raw_total_budget = float(current_vis_len)
-                budget_fallback_used = False
-                budget_clamped_by_target = False
-                absolute_anchor_budget = None
-                absolute_controller_ratio = 1.0
-                elbow_strengths: List[float] = []
-                realized_coverages: List[float] = []
+                if fixed_single_shot_fast_path:
+                    schedule_t0 = time.perf_counter() if detailed_timing else None
+                    total_keep = int(getattr(self.config, "b_min", current_vis_len) or current_vis_len)
+                    configured_visual_budget_cap = (
+                        int(self.config.target_token_num) if int(self.config.target_token_num) > 0 else None
+                    )
+                    if configured_visual_budget_cap is not None:
+                        total_keep = min(total_keep, configured_visual_budget_cap)
+                    total_keep = max(1, min(total_keep, current_vis_len))
 
-                if self.config.monitor_only:
-                    total_budget = torch.tensor(float(current_vis_len), device=hidden_states.device)
-                    keep_counts = [c_h, c_w]
-                else:
-                    if budget_mode == "elbow":
-                        keep_counts, elbow_strengths = allocate_keep_counts_by_elbow_two_views(
-                            attn_head,
-                            attn_wrist,
-                            self.config.min_keep_per_view,
-                        )
-                        raw_total_budget = float(sum(keep_counts))
-                        total_keep = int(round(raw_total_budget))
+                    view_importance = torch.stack([
+                        _finite_scalar(attn_head.float().sum(), default=0.0, min_value=0.0),
+                        _finite_scalar(attn_wrist.float().sum(), default=0.0, min_value=0.0),
+                    ])
+                    if float(view_importance.sum().item()) <= 0.0:
+                        alloc_weights = torch.ones_like(view_importance) / max(1, view_importance.numel())
                     else:
-                        if absolute_anchor_mode == "elbow":
-                            anchor_keep_counts, elbow_strengths = allocate_keep_counts_by_elbow_two_views(
+                        alloc_weights = view_importance / view_importance.sum()
+
+                    keep_counts = allocate_keep_counts(
+                        [c_h, c_w],
+                        total_keep,
+                        min_keep_per_view=self.config.min_keep_per_view,
+                        weights=alloc_weights,
+                    )
+                    total_budget = torch.tensor(float(total_keep), device=hidden_states.device)
+                    raw_total_budget = float(total_keep)
+
+                    self.runtime_stats["budget_mode"] = "absolute_fixed_fastpath"
+                    self.runtime_stats["raw_total_budget"] = float(raw_total_budget)
+                    self.runtime_stats["total_budget"] = float(total_budget.detach().cpu())
+                    self.runtime_stats["selected_pruning_mode"] = "single_shot_fixed_fastpath"
+
+                    if keep_counts[0] >= c_h and keep_counts[1] >= c_w:
+                        self.keep_percent_schedule = [[1.0, 1.0]]
+                        self.keep_count_schedule = [[c_h, c_w]]
+                        self.compaction_layer_flags = [False]
+                    else:
+                        ratio_h = max(0.001, min(1.0, float(keep_counts[0]) / float(max(c_h, 1))))
+                        ratio_w = max(0.001, min(1.0, float(keep_counts[1]) / float(max(c_w, 1))))
+                        self.keep_percent_schedule = [[ratio_h, ratio_w]]
+                        self.keep_count_schedule = [[int(keep_counts[0]), int(keep_counts[1])]]
+                        self.compaction_layer_flags = [True]
+                    self.manual_probe_anchor_layers = {self.config.start_layer}
+                    self._sync_projection_hooks(self._desired_manual_probe_hook_layers())
+                    self.runtime_stats["schedule_len"] = len(self.keep_percent_schedule)
+                    self.runtime_stats["planned_compaction_layers"] = int(
+                        sum(1 for flag in self.compaction_layer_flags if flag)
+                    )
+                    if detailed_timing and schedule_t0 is not None:
+                        self.runtime_stats["budget_schedule_seconds"] = float(
+                            self.runtime_stats.get("budget_schedule_seconds", 0.0) + (time.perf_counter() - schedule_t0)
+                        )
+                else:
+                    metric_t0 = time.perf_counter() if detailed_timing else None
+
+                    def get_metric(view_attn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                        norm = view_attn / (view_attn.sum(dim=-1, keepdim=True) + 1e-9)
+                        mi_vec, kl_vec = calculate_mi_and_kl(norm[0])
+                        denom = max(1, norm.shape[2])
+                        return mi_vec.sum() / denom, kl_vec.sum() / denom
+
+                    mi_h, kl_h = get_metric(attn_head)
+                    mi_w, kl_w = get_metric(attn_wrist)
+                    nmi_h = _finite_scalar(mi_h / (kl_h + 1e-6), default=1e-6, min_value=1e-6)
+                    nmi_w = _finite_scalar(mi_w / (kl_w + 1e-6), default=1e-6, min_value=1e-6)
+                    if detailed_timing and metric_t0 is not None:
+                        self.runtime_stats["metric_seconds"] = float(
+                            self.runtime_stats.get("metric_seconds", 0.0) + (time.perf_counter() - metric_t0)
+                        )
+
+                    if self.cached_rank is None:
+                        rank_t0 = time.perf_counter() if detailed_timing else None
+                        text_start = int(query_positions[0].item())
+                        self.cached_rank = self._calculate_effective_rank(hidden_states, slice(text_start, seq_len))
+                        if detailed_timing and rank_t0 is not None:
+                            self.runtime_stats["rank_seconds"] = float(
+                                self.runtime_stats.get("rank_seconds", 0.0) + (time.perf_counter() - rank_t0)
+                            )
+
+                    schedule_t0 = time.perf_counter() if detailed_timing else None
+                    self.cached_rank = _finite_scalar(self.cached_rank, default=1.0, min_value=1.0)
+                    nmi_avg = (nmi_h + nmi_w) / 2.0
+                    complexity_signal = _finite_scalar(
+                        self.cached_rank / torch.clamp(nmi_avg, min=1e-6),
+                        default=float(self.config.mu),
+                        min_value=1e-6,
+                    )
+                    complexity_score = float(
+                        logistic_complexity_score(
+                            complexity_signal,
+                            getattr(self.config, "adaptive_layer_mu", self.config.mu),
+                            getattr(self.config, "adaptive_layer_tau", self.config.tau),
+                        ).item()
+                    )
+
+                    kl_tensor = torch.stack([
+                        _finite_scalar(kl_h, default=0.0, min_value=0.0),
+                        _finite_scalar(kl_w, default=0.0, min_value=0.0),
+                    ])
+                    budget_mode = str(getattr(self.config, "budget_mode", "absolute") or "absolute").lower()
+                    absolute_anchor_mode = str(getattr(self.config, "absolute_anchor_mode", "none") or "none").lower()
+                    configured_visual_budget_cap = int(self.config.target_token_num) if int(self.config.target_token_num) > 0 else None
+                    raw_total_budget = float(current_vis_len)
+                    budget_fallback_used = False
+                    budget_clamped_by_target = False
+                    absolute_anchor_budget = None
+                    absolute_controller_ratio = 1.0
+                    elbow_strengths: List[float] = []
+                    realized_coverages: List[float] = []
+
+                    if self.config.monitor_only:
+                        total_budget = torch.tensor(float(current_vis_len), device=hidden_states.device)
+                        keep_counts = [c_h, c_w]
+                    else:
+                        if budget_mode == "elbow":
+                            keep_counts, elbow_strengths = allocate_keep_counts_by_elbow_two_views(
                                 attn_head,
                                 attn_wrist,
                                 self.config.min_keep_per_view,
                             )
-                            absolute_anchor_budget = float(sum(anchor_keep_counts))
+                            raw_total_budget = float(sum(keep_counts))
+                            total_keep = int(round(raw_total_budget))
+                        else:
+                            if absolute_anchor_mode == "elbow":
+                                anchor_keep_counts, elbow_strengths = allocate_keep_counts_by_elbow_two_views(
+                                    attn_head,
+                                    attn_wrist,
+                                    self.config.min_keep_per_view,
+                                )
+                                absolute_anchor_budget = float(sum(anchor_keep_counts))
 
-                        raw_total_budget, auto_lower_bound, auto_upper_bound, normalized_signal, reference_signal, absolute_anchor_budget, absolute_controller_ratio = decide_absolute_budget_v2(
-                            self.config,
-                            complexity_signal,
-                            self.cached_rank,
-                            [c_h, c_w],
-                            current_vis_len,
-                            anchor_budget=absolute_anchor_budget,
-                        )
-                        if not math.isfinite(raw_total_budget):
-                            raw_total_budget = float(min(current_vis_len, max(1, self.config.target_token_num)))
-                            budget_fallback_used = True
-                        total_keep = int(round(raw_total_budget))
+                            raw_total_budget, auto_lower_bound, auto_upper_bound, normalized_signal, reference_signal, absolute_anchor_budget, absolute_controller_ratio = decide_absolute_budget_v2(
+                                self.config,
+                                complexity_signal,
+                                self.cached_rank,
+                                [c_h, c_w],
+                                current_vis_len,
+                                anchor_budget=absolute_anchor_budget,
+                            )
+                            if not math.isfinite(raw_total_budget):
+                                raw_total_budget = float(min(current_vis_len, max(1, self.config.target_token_num)))
+                                budget_fallback_used = True
+                            total_keep = int(round(raw_total_budget))
 
-                        temp = max(float(self.config.allocation_temp), 1e-4)
-                        alloc_signal = torch.log1p(torch.clamp(kl_tensor, min=0.0))
-                        alloc_weights = torch.softmax(alloc_signal / temp, dim=0)
-                        alloc_weights = torch.nan_to_num(alloc_weights, nan=0.0, posinf=0.0, neginf=0.0)
-                        if float(alloc_weights.sum().item()) <= 0.0:
-                            alloc_weights = torch.ones_like(alloc_weights) / max(1, alloc_weights.numel())
-                        if configured_visual_budget_cap is not None:
-                            clamped_keep = min(total_keep, configured_visual_budget_cap)
-                            budget_clamped_by_target = clamped_keep != total_keep
-                            total_keep = clamped_keep
-                        total_keep = max(1, min(total_keep, current_vis_len))
-                        keep_counts = allocate_keep_counts(
-                            [c_h, c_w],
-                            total_keep,
-                            min_keep_per_view=self.config.min_keep_per_view,
-                            weights=alloc_weights,
-                        )
-                        total_budget = torch.tensor(float(total_keep), device=hidden_states.device)
-
-                    if budget_mode == "elbow":
-                        if configured_visual_budget_cap is not None:
-                            clamped_keep = min(total_keep, configured_visual_budget_cap)
-                            budget_clamped_by_target = clamped_keep != total_keep
-                            total_keep = clamped_keep
-                        total_keep = max(1, min(total_keep, current_vis_len))
-                        temp = max(float(self.config.allocation_temp), 1e-4)
-                        alloc_signal = torch.log1p(torch.clamp(kl_tensor, min=0.0))
-                        alloc_weights = torch.softmax(alloc_signal / temp, dim=0)
-                        alloc_weights = torch.nan_to_num(alloc_weights, nan=0.0, posinf=0.0, neginf=0.0)
-                        if float(alloc_weights.sum().item()) <= 0.0:
-                            alloc_weights = torch.ones_like(alloc_weights) / max(1, alloc_weights.numel())
-                        if sum(keep_counts) != total_keep:
+                            temp = max(float(self.config.allocation_temp), 1e-4)
+                            alloc_signal = torch.log1p(torch.clamp(kl_tensor, min=0.0))
+                            alloc_weights = torch.softmax(alloc_signal / temp, dim=0)
+                            alloc_weights = torch.nan_to_num(alloc_weights, nan=0.0, posinf=0.0, neginf=0.0)
+                            if float(alloc_weights.sum().item()) <= 0.0:
+                                alloc_weights = torch.ones_like(alloc_weights) / max(1, alloc_weights.numel())
+                            if configured_visual_budget_cap is not None:
+                                clamped_keep = min(total_keep, configured_visual_budget_cap)
+                                budget_clamped_by_target = clamped_keep != total_keep
+                                total_keep = clamped_keep
+                            total_keep = max(1, min(total_keep, current_vis_len))
                             keep_counts = allocate_keep_counts(
                                 [c_h, c_w],
                                 total_keep,
                                 min_keep_per_view=self.config.min_keep_per_view,
                                 weights=alloc_weights,
                             )
-                        total_budget = torch.tensor(float(total_keep), device=hidden_states.device)
+                            total_budget = torch.tensor(float(total_keep), device=hidden_states.device)
 
-                total_budget = torch.clamp(
-                    total_budget,
-                    min=float(min(2, current_vis_len)),
-                    max=float(current_vis_len),
-                )
-
-                self.runtime_stats["nmi_head"] = float(nmi_h.detach().cpu())
-                self.runtime_stats["nmi_wrist"] = float(nmi_w.detach().cpu())
-                self.runtime_stats["effective_rank"] = float(self.cached_rank.detach().cpu())
-                self.runtime_stats["total_budget"] = float(total_budget.detach().cpu())
-                self.runtime_stats["complexity_signal"] = float(complexity_signal.detach().cpu())
-                self.runtime_stats["complexity_score"] = float(complexity_score)
-                self.runtime_stats["budget_mode"] = budget_mode
-                self.runtime_stats["raw_total_budget"] = float(raw_total_budget)
-                self.runtime_stats["absolute_anchor_mode"] = absolute_anchor_mode
-                self.runtime_stats["absolute_budget_scale"] = float(getattr(self.config, "absolute_budget_scale", 1.0))
-                self.runtime_stats["absolute_anchor_budget"] = (
-                    float(absolute_anchor_budget) if absolute_anchor_budget is not None else None
-                )
-                self.runtime_stats["absolute_controller_ratio"] = float(absolute_controller_ratio)
-                self.runtime_stats["budget_fallback_used"] = int(bool(budget_fallback_used))
-                self.runtime_stats["budget_clamped_by_target"] = int(bool(budget_clamped_by_target))
-                if elbow_strengths:
-                    self.runtime_stats["elbow_strengths"] = [float(v) for v in elbow_strengths]
-                if realized_coverages:
-                    self.runtime_stats["realized_view_coverages"] = [float(v) for v in realized_coverages]
-
-                max_h = torch.tensor(float(max(c_h, 1)), device=hidden_states.device)
-                max_w = torch.tensor(float(max(c_w, 1)), device=hidden_states.device)
-                t_h = torch.tensor(float(keep_counts[0]), device=hidden_states.device)
-                t_w = torch.tensor(float(keep_counts[1]), device=hidden_states.device)
-
-                no_prune_control = keep_counts[0] >= c_h and keep_counts[1] >= c_w
-                if no_prune_control:
-                    if self.config.disable_progressive_prune:
-                        self.keep_percent_schedule = [[1.0, 1.0]]
-                        self.keep_count_schedule = [[c_h, c_w]]
-                        self.compaction_layer_flags = [False]
-                    else:
-                        self.keep_percent_schedule = [
-                            [1.0, 1.0] for _ in range(max(1, len(self.pruning_loc)))
-                        ]
-                        self.keep_count_schedule = [
-                            [c_h, c_w] for _ in range(max(1, len(self.pruning_loc)))
-                        ]
-                        self.compaction_layer_flags = [False for _ in range(max(1, len(self.pruning_loc)))]
-                elif self.config.disable_progressive_prune:
-                    ratio_h = torch.clamp(t_h / max_h, min=0.001, max=1.0)
-                    ratio_w = torch.clamp(t_w / max_w, min=0.001, max=1.0)
-                    self.keep_percent_schedule = [[float(ratio_h.item()), float(ratio_w.item())]]
-                    self.keep_count_schedule = [[int(keep_counts[0]), int(keep_counts[1])]]
-                    self.compaction_layer_flags = [True]
-                else:
-                    num_sched_layers = max(1, len(self.pruning_loc))
-                    x0_h = self._effective_x0_for_target(int(keep_counts[0]), c_h)
-                    x0_w = self._effective_x0_for_target(int(keep_counts[1]), c_w)
-                    s_h = self._generate_schedule_aligned(t_h * num_sched_layers, x0_h, self.config.k_shape)
-                    s_w = self._generate_schedule_aligned(t_w * num_sched_layers, x0_w, self.config.k_shape)
-                    self.runtime_stats["effective_x0_head"] = float(x0_h)
-                    self.runtime_stats["effective_x0_wrist"] = float(x0_w)
-                    self.manual_probe_anchor_layers = self._resolve_manual_probe_anchor_layers((x0_h + x0_w) / 2.0)
-                    dense_h = self._simulate_dense_keep_counts(c_h, s_h, self.config.min_keep_per_view)
-                    dense_w = self._simulate_dense_keep_counts(c_w, s_w, self.config.min_keep_per_view)
-                    self.keep_percent_schedule = torch.stack([s_h, s_w], dim=1).tolist()
-                    full_keep_count_schedule = [
-                        [int(k_h_val), int(k_w_val)]
-                        for k_h_val, k_w_val in zip(dense_h, dense_w)
-                    ]
-
-                    if self.config.piecewise_linear_keep_schedule:
-                        max_shots = int(getattr(self.config, "physical_compaction_max_shots", 0) or 0)
-                        if max_shots > 0:
-                            if self.config.piecewise_linear_hard_final_cap:
-                                keep_count_schedule, compaction_flags = self._build_sparse_compaction_keep_counts(
-                                    dense_h,
-                                    dense_w,
-                                    c_h,
-                                    c_w,
-                                    int(keep_counts[0]),
-                                    int(keep_counts[1]),
-                                    max_shots,
+                        if budget_mode == "elbow":
+                            if configured_visual_budget_cap is not None:
+                                clamped_keep = min(total_keep, configured_visual_budget_cap)
+                                budget_clamped_by_target = clamped_keep != total_keep
+                                total_keep = clamped_keep
+                            total_keep = max(1, min(total_keep, current_vis_len))
+                            temp = max(float(self.config.allocation_temp), 1e-4)
+                            alloc_signal = torch.log1p(torch.clamp(kl_tensor, min=0.0))
+                            alloc_weights = torch.softmax(alloc_signal / temp, dim=0)
+                            alloc_weights = torch.nan_to_num(alloc_weights, nan=0.0, posinf=0.0, neginf=0.0)
+                            if float(alloc_weights.sum().item()) <= 0.0:
+                                alloc_weights = torch.ones_like(alloc_weights) / max(1, alloc_weights.numel())
+                            if sum(keep_counts) != total_keep:
+                                keep_counts = allocate_keep_counts(
+                                    [c_h, c_w],
+                                    total_keep,
+                                    min_keep_per_view=self.config.min_keep_per_view,
+                                    weights=alloc_weights,
                                 )
-                            else:
-                                keep_count_schedule, compaction_flags = self._build_sparse_area_matched_keep_counts(
-                                    dense_h,
-                                    dense_w,
-                                    c_h,
-                                    c_w,
-                                    max_shots,
-                                )
+                            total_budget = torch.tensor(float(total_keep), device=hidden_states.device)
+
+                    total_budget = torch.clamp(
+                        total_budget,
+                        min=float(min(2, current_vis_len)),
+                        max=float(current_vis_len),
+                    )
+
+                    self.runtime_stats["nmi_head"] = float(nmi_h.detach().cpu())
+                    self.runtime_stats["nmi_wrist"] = float(nmi_w.detach().cpu())
+                    self.runtime_stats["effective_rank"] = float(self.cached_rank.detach().cpu())
+                    self.runtime_stats["total_budget"] = float(total_budget.detach().cpu())
+                    self.runtime_stats["complexity_signal"] = float(complexity_signal.detach().cpu())
+                    self.runtime_stats["complexity_score"] = float(complexity_score)
+                    self.runtime_stats["budget_mode"] = budget_mode
+                    self.runtime_stats["raw_total_budget"] = float(raw_total_budget)
+                    self.runtime_stats["absolute_anchor_mode"] = absolute_anchor_mode
+                    self.runtime_stats["absolute_budget_scale"] = float(getattr(self.config, "absolute_budget_scale", 1.0))
+                    self.runtime_stats["absolute_anchor_budget"] = (
+                        float(absolute_anchor_budget) if absolute_anchor_budget is not None else None
+                    )
+                    self.runtime_stats["absolute_controller_ratio"] = float(absolute_controller_ratio)
+                    self.runtime_stats["budget_fallback_used"] = int(bool(budget_fallback_used))
+                    self.runtime_stats["budget_clamped_by_target"] = int(bool(budget_clamped_by_target))
+                    if elbow_strengths:
+                        self.runtime_stats["elbow_strengths"] = [float(v) for v in elbow_strengths]
+                    if realized_coverages:
+                        self.runtime_stats["realized_view_coverages"] = [float(v) for v in realized_coverages]
+
+                    max_h = torch.tensor(float(max(c_h, 1)), device=hidden_states.device)
+                    max_w = torch.tensor(float(max(c_w, 1)), device=hidden_states.device)
+                    t_h = torch.tensor(float(keep_counts[0]), device=hidden_states.device)
+                    t_w = torch.tensor(float(keep_counts[1]), device=hidden_states.device)
+
+                    no_prune_control = keep_counts[0] >= c_h and keep_counts[1] >= c_w
+                    if no_prune_control:
+                        if self.config.disable_progressive_prune:
+                            self.keep_percent_schedule = [[1.0, 1.0]]
+                            self.keep_count_schedule = [[c_h, c_w]]
+                            self.compaction_layer_flags = [False]
                         else:
-                            sched_h = self._build_piecewise_linear_keep_counts(dense_h, c_h, keep_counts[0])
-                            sched_w = self._build_piecewise_linear_keep_counts(dense_w, c_w, keep_counts[1])
-                            keep_count_schedule = [
-                                [int(k_h_val), int(k_w_val)]
-                                for k_h_val, k_w_val in zip(sched_h, sched_w)
+                            self.keep_percent_schedule = [
+                                [1.0, 1.0] for _ in range(max(1, len(self.pruning_loc)))
                             ]
+                            self.keep_count_schedule = [
+                                [c_h, c_w] for _ in range(max(1, len(self.pruning_loc)))
+                            ]
+                            self.compaction_layer_flags = [False for _ in range(max(1, len(self.pruning_loc)))]
+                    elif self.config.disable_progressive_prune:
+                        ratio_h = torch.clamp(t_h / max_h, min=0.001, max=1.0)
+                        ratio_w = torch.clamp(t_w / max_w, min=0.001, max=1.0)
+                        self.keep_percent_schedule = [[float(ratio_h.item()), float(ratio_w.item())]]
+                        self.keep_count_schedule = [[int(keep_counts[0]), int(keep_counts[1])]]
+                        self.compaction_layer_flags = [True]
+                    else:
+                        num_sched_layers = max(1, len(self.pruning_loc))
+                        x0_h = self._effective_x0_for_target(int(keep_counts[0]), c_h)
+                        x0_w = self._effective_x0_for_target(int(keep_counts[1]), c_w)
+                        s_h = self._generate_schedule_aligned(t_h * num_sched_layers, x0_h, self.config.k_shape)
+                        s_w = self._generate_schedule_aligned(t_w * num_sched_layers, x0_w, self.config.k_shape)
+                        self.runtime_stats["effective_x0_head"] = float(x0_h)
+                        self.runtime_stats["effective_x0_wrist"] = float(x0_w)
+                        self.manual_probe_anchor_layers = self._resolve_manual_probe_anchor_layers((x0_h + x0_w) / 2.0)
+                        self._sync_projection_hooks(self._desired_manual_probe_hook_layers())
+                        dense_h = self._simulate_dense_keep_counts(c_h, s_h, self.config.min_keep_per_view)
+                        dense_w = self._simulate_dense_keep_counts(c_w, s_w, self.config.min_keep_per_view)
+                        self.keep_percent_schedule = torch.stack([s_h, s_w], dim=1).tolist()
+                        full_keep_count_schedule = [
+                            [int(k_h_val), int(k_w_val)]
+                            for k_h_val, k_w_val in zip(dense_h, dense_w)
+                        ]
+
+                        if self.config.piecewise_linear_keep_schedule:
+                            max_shots = int(getattr(self.config, "physical_compaction_max_shots", 0) or 0)
+                            if max_shots > 0:
+                                if self.config.piecewise_linear_hard_final_cap:
+                                    keep_count_schedule, compaction_flags = self._build_sparse_compaction_keep_counts(
+                                        dense_h,
+                                        dense_w,
+                                        c_h,
+                                        c_w,
+                                        int(keep_counts[0]),
+                                        int(keep_counts[1]),
+                                        max_shots,
+                                    )
+                                else:
+                                    keep_count_schedule, compaction_flags = self._build_sparse_area_matched_keep_counts(
+                                        dense_h,
+                                        dense_w,
+                                        c_h,
+                                        c_w,
+                                        max_shots,
+                                    )
+                            else:
+                                sched_h = self._build_piecewise_linear_keep_counts(dense_h, c_h, keep_counts[0])
+                                sched_w = self._build_piecewise_linear_keep_counts(dense_w, c_w, keep_counts[1])
+                                keep_count_schedule = [
+                                    [int(k_h_val), int(k_w_val)]
+                                    for k_h_val, k_w_val in zip(sched_h, sched_w)
+                                ]
+                                prev_h, prev_w = c_h, c_w
+                                compaction_flags = []
+                                for k_h_val, k_w_val in keep_count_schedule:
+                                    should_compact = (int(k_h_val) < int(prev_h)) or (int(k_w_val) < int(prev_w))
+                                    compaction_flags.append(bool(should_compact))
+                                    prev_h, prev_w = int(k_h_val), int(k_w_val)
+                        else:
+                            keep_count_schedule = [list(counts) for counts in full_keep_count_schedule]
                             prev_h, prev_w = c_h, c_w
                             compaction_flags = []
                             for k_h_val, k_w_val in keep_count_schedule:
                                 should_compact = (int(k_h_val) < int(prev_h)) or (int(k_w_val) < int(prev_w))
                                 compaction_flags.append(bool(should_compact))
                                 prev_h, prev_w = int(k_h_val), int(k_w_val)
-                    else:
-                        keep_count_schedule = [list(counts) for counts in full_keep_count_schedule]
-                        prev_h, prev_w = c_h, c_w
-                        compaction_flags = []
-                        for k_h_val, k_w_val in keep_count_schedule:
-                            should_compact = (int(k_h_val) < int(prev_h)) or (int(k_w_val) < int(prev_w))
-                            compaction_flags.append(bool(should_compact))
-                            prev_h, prev_w = int(k_h_val), int(k_w_val)
 
-                    active_pruning_loc = [int(layer_idx) for layer_idx in self.pruning_loc]
-                    active_schedule = [list(map(int, counts)) for counts in keep_count_schedule]
-                    selected_pruning_mode = "progressive_full_dense"
-                    if bool(getattr(self.config, "enable_adaptive_layer_policy", False)):
-                        active_pruning_loc, active_schedule = compress_keep_count_schedule(self.pruning_loc, keep_count_schedule)
-                        layer_policy_loc, adaptive_layer_score = resolve_adaptive_pruning_layer_count(
-                            self.config,
+                        active_pruning_loc = [int(layer_idx) for layer_idx in self.pruning_loc]
+                        active_schedule = [list(map(int, counts)) for counts in keep_count_schedule]
+                        selected_pruning_mode = "progressive_full_dense"
+                        if bool(getattr(self.config, "enable_adaptive_layer_policy", False)):
+                            active_pruning_loc, active_schedule = compress_keep_count_schedule(self.pruning_loc, keep_count_schedule)
+                            layer_policy_loc, adaptive_layer_score = resolve_adaptive_pruning_layer_count(
+                                self.config,
+                                active_pruning_loc,
+                                complexity_signal,
+                            )
+                            if layer_policy_loc:
+                                schedule_index = {
+                                    int(layer_idx): idx for idx, layer_idx in enumerate(active_pruning_loc)
+                                }
+                                active_pruning_loc = [int(layer_idx) for layer_idx in layer_policy_loc]
+                                active_schedule = [
+                                    list(map(int, active_schedule[schedule_index[int(layer_idx)]]))
+                                    for layer_idx in active_pruning_loc
+                                ]
+                                self.runtime_stats["adaptive_layer_count_score"] = float(adaptive_layer_score)
+                            if active_pruning_loc and bool(getattr(self.config, "enable_oneshot_fallback", False)) and should_use_oneshot_fallback(
+                                self.config,
+                                active_schedule,
+                                [int(keep_counts[0]), int(keep_counts[1])],
+                            ):
+                                active_pruning_loc = [int(self.pruning_loc[0])]
+                                active_schedule = [[int(keep_counts[0]), int(keep_counts[1])]]
+                                selected_pruning_mode = "schedule_compressed_1layer"
+                            elif active_pruning_loc:
+                                selected_pruning_mode = "schedule_compressed_multilayer"
+
+                        self.keep_count_schedule, self.compaction_layer_flags = self._expand_active_keep_schedule(
+                            self.pruning_loc,
                             active_pruning_loc,
-                            complexity_signal,
-                        )
-                        if layer_policy_loc:
-                            schedule_index = {
-                                int(layer_idx): idx for idx, layer_idx in enumerate(active_pruning_loc)
-                            }
-                            active_pruning_loc = [int(layer_idx) for layer_idx in layer_policy_loc]
-                            active_schedule = [
-                                list(map(int, active_schedule[schedule_index[int(layer_idx)]]))
-                                for layer_idx in active_pruning_loc
-                            ]
-                            self.runtime_stats["adaptive_layer_count_score"] = float(adaptive_layer_score)
-                        if active_pruning_loc and bool(getattr(self.config, "enable_oneshot_fallback", False)) and should_use_oneshot_fallback(
-                            self.config,
                             active_schedule,
-                            [int(keep_counts[0]), int(keep_counts[1])],
-                        ):
-                            active_pruning_loc = [int(self.pruning_loc[0])]
-                            active_schedule = [[int(keep_counts[0]), int(keep_counts[1])]]
-                            selected_pruning_mode = "schedule_compressed_1layer"
-                        elif active_pruning_loc:
-                            selected_pruning_mode = "schedule_compressed_multilayer"
-
-                    self.keep_count_schedule, self.compaction_layer_flags = self._expand_active_keep_schedule(
-                        self.pruning_loc,
-                        active_pruning_loc,
-                        active_schedule,
-                    )
-                    self.keep_percent_schedule = self._counts_to_keep_ratios(self.keep_count_schedule, c_h, c_w)
-                    self.manual_probe_anchor_layers = set(active_pruning_loc) if active_pruning_loc else {self.config.start_layer}
-                    self.runtime_stats["selected_pruning_mode"] = selected_pruning_mode
-                    self.runtime_stats["dense_keep_count_schedule"] = [
-                        [int(k_h_val), int(k_w_val)] for k_h_val, k_w_val in full_keep_count_schedule
-                    ]
-                    self.runtime_stats["active_pruning_layer_indices"] = [int(layer_idx) for layer_idx in active_pruning_loc]
-                    self.runtime_stats["dense_pruning_layer_indices"] = [int(layer_idx) for layer_idx in self.pruning_loc]
-                    self.runtime_stats["compressed_schedule_length"] = int(len(active_schedule))
-                self.runtime_stats["schedule_len"] = len(self.keep_percent_schedule)
-                self.runtime_stats["planned_compaction_layers"] = int(sum(1 for flag in self.compaction_layer_flags if flag))
-                if detailed_timing and schedule_t0 is not None:
-                    self.runtime_stats["budget_schedule_seconds"] = float(
-                        self.runtime_stats.get("budget_schedule_seconds", 0.0) + (time.perf_counter() - schedule_t0)
-                    )
+                        )
+                        self.keep_percent_schedule = self._counts_to_keep_ratios(self.keep_count_schedule, c_h, c_w)
+                        self.manual_probe_anchor_layers = set(active_pruning_loc) if active_pruning_loc else {self.config.start_layer}
+                        self._sync_projection_hooks(self._desired_manual_probe_hook_layers())
+                        self.runtime_stats["selected_pruning_mode"] = selected_pruning_mode
+                        self.runtime_stats["dense_keep_count_schedule"] = [
+                            [int(k_h_val), int(k_w_val)] for k_h_val, k_w_val in full_keep_count_schedule
+                        ]
+                        self.runtime_stats["active_pruning_layer_indices"] = [int(layer_idx) for layer_idx in active_pruning_loc]
+                        self.runtime_stats["dense_pruning_layer_indices"] = [int(layer_idx) for layer_idx in self.pruning_loc]
+                        self.runtime_stats["compressed_schedule_length"] = int(len(active_schedule))
+                    self.runtime_stats["schedule_len"] = len(self.keep_percent_schedule)
+                    self.runtime_stats["planned_compaction_layers"] = int(sum(1 for flag in self.compaction_layer_flags if flag))
+                    if detailed_timing and schedule_t0 is not None:
+                        self.runtime_stats["budget_schedule_seconds"] = float(
+                            self.runtime_stats.get("budget_schedule_seconds", 0.0) + (time.perf_counter() - schedule_t0)
+                        )
 
                 if self.config.debug:
                     print(
@@ -2187,12 +2447,21 @@ class NoraAutoPrunePatch:
 
             if self.keep_count_schedule and 0 <= sched_idx < len(self.keep_count_schedule):
                 target_h, target_w = self.keep_count_schedule[sched_idx]
-                k_h = 0 if c_h <= 0 else max(min(int(target_h), c_h), min(self.config.min_keep_per_view, c_h))
-                k_w = 0 if c_w <= 0 else max(min(int(target_w), c_w), min(self.config.min_keep_per_view, c_w))
+                effective_min_keep = self._effective_min_keep_for_total_budget(
+                    [c_h, c_w],
+                    int(target_h) + int(target_w),
+                )
+                k_h = 0 if c_h <= 0 else max(min(int(target_h), c_h), min(effective_min_keep, c_h))
+                k_w = 0 if c_w <= 0 else max(min(int(target_w), c_w), min(effective_min_keep, c_w))
             else:
                 ratios = self.keep_percent_schedule[sched_idx]
-                k_h = 0 if c_h <= 0 else max(int(c_h * ratios[0]), min(self.config.min_keep_per_view, c_h))
-                k_w = 0 if c_w <= 0 else max(int(c_w * ratios[1]), min(self.config.min_keep_per_view, c_w))
+                target_total = int(round((c_h * float(ratios[0])) + (c_w * float(ratios[1]))))
+                effective_min_keep = self._effective_min_keep_for_total_budget(
+                    [c_h, c_w],
+                    target_total,
+                )
+                k_h = 0 if c_h <= 0 else max(int(c_h * ratios[0]), min(effective_min_keep, c_h))
+                k_w = 0 if c_w <= 0 else max(int(c_w * ratios[1]), min(effective_min_keep, c_w))
 
             if k_h >= c_h and k_w >= c_w:
                 self.runtime_stats["last_tokens_before"] = int(curr_vis_len)
@@ -2246,6 +2515,23 @@ class NoraAutoPrunePatch:
             expanded_indices = full_indices.unsqueeze(-1).expand(-1, -1, current_output.size(-1))
             pruned_hidden = current_output.gather(1, expanded_indices).contiguous()
 
+            compacted_cache_layers = self._compact_past_key_values(
+                kwargs.get("past_key_value", None),
+                full_indices,
+                layer_idx,
+            )
+
+            compacted_position_ids = self._gather_position_ids(position_ids, full_indices)
+            if compacted_position_ids is not None:
+                self.cached_position_ids = compacted_position_ids
+            compacted_position_embeddings = self._gather_position_embeddings(
+                kwargs.get("position_embeddings"),
+                full_indices,
+                batch_size,
+            )
+            if compacted_position_embeddings is not None:
+                self.cached_position_embeddings = compacted_position_embeddings
+
             if self.global_indices is not None:
                 current_globals = self.global_indices
                 if current_globals.shape[0] == 1 and batch_size > 1:
@@ -2261,6 +2547,12 @@ class NoraAutoPrunePatch:
 
             self.view_boundary_tracker["current_h"] = k_h
             self.view_boundary_tracker["current_w"] = k_w
+            always_keep_count = int(always_keep_positions.numel()) if always_keep_positions is not None else 0
+            self.runtime_stats["expected_compacted_seq_len"] = int(always_keep_count + k_h + k_w)
+            self.runtime_stats["final_visual_tokens"] = int(k_h + k_w)
+            if compacted_cache_layers > 0:
+                self.runtime_stats["decoder_layers_recorded"] = float(compacted_cache_layers)
+                self.runtime_stats["decoder_layers_missing"] = float(max(0, self.num_layers - compacted_cache_layers))
             self.runtime_stats["pruned_layers"] = int(self.runtime_stats.get("pruned_layers", 0) + 1)
 
             # Preserve original return signature (with/without attentions) after replacing hidden_states.
