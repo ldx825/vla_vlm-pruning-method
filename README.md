@@ -32,6 +32,10 @@ methods/
 integrations/
   openvla_oft/libero/ # OpenVLA-OFT + LIBERO 的主要接入目录
   openvla_oft/scripts/# OpenVLA-OFT 单实验、debug 和表格队列脚本
+  openvla_oft/fastervlm/     # FasterVLM 的独立 OpenVLA-OFT patch 与单实验脚本
+  openvla_oft/visionzip/     # VisionZip 的独立 OpenVLA-OFT patch 与单实验脚本
+  openvla_oft/pyramiddrop/   # PyramidDrop 的独立 OpenVLA-OFT patch 与单实验脚本
+  openvla_oft/baseline_libero/ # 三个 baseline 共用、已接好统计接口的 LIBERO 评测入口
   nora/libero/        # NORA + LIBERO 接入、profile 和评测入口
   nora/scripts/       # NORA 调试与批量实验脚本
   mantis/             # Mantis mLLaVA pruning adapters
@@ -73,6 +77,49 @@ FastV 当前实现遵循论文流程：
 4. 后续 decoder layer 只在剪短后的序列上继续前向。
 
 OpenVLA-OFT 的 LIBERO 推理不是自回归 KV-cache generation，因此 FastV 不处理 KV-cache，只做 hidden states、position ids、position embeddings 和 attention mask 的序列对齐。latency 和 FLOPs 字段与 AutoPrune 统计口径保持一致。
+
+### FasterVLM / VisionZip / PyramidDrop
+
+三个 baseline 的稳定 OpenVLA-OFT 适配按方法独立归档：
+
+| 目录 | 核心实现 | 剪枝位置与预算语义 |
+| --- | --- | --- |
+| `integrations/openvla_oft/fastervlm/` | `fastervlm_patch.py` | 视觉编码器最终层 CLS-to-patch attention 全局排序；在 LLM prefill 前真实保留指定视觉 token 数 |
+| `integrations/openvla_oft/visionzip/` | `visionzip_patch.py` | 在 projected visual embeddings 上构造 dominant/contextual/global tokens；最终 token 数按约 70%/30% 分配 |
+| `integrations/openvla_oft/pyramiddrop/` | `pyramiddrop_patch.py` | 在 decoder stage 末逐步剪枝；传入参数表示所有 decoder 层的平均视觉 token 数，并自动求解 λ |
+| `integrations/openvla_oft/baseline_libero/` | `run_libero_eval.py` | 三个 baseline 共用的 LIBERO 入口，统一记录 success rate、latency 和 FLOPs reduction |
+
+这些 baseline 遵循相同实验约定：
+
+- 所有相机视角组成一个统一视觉 token 池，不进行按视角预算分配。
+- 执行真实序列剪枝，后续 LLM 层实际接收更短的 hidden states，而不是仅使用 attention mask 做假剪枝。
+- 保留 token 原始顺序，并同步处理 attention mask、position IDs、position embeddings 和 OpenVLA-OFT 动作 token 偏移。
+- proprio token、diffusion timestep token、文本 token 与动作 token 不会被当作视觉 token 删除。
+- PyramidDrop 只使用动作占位符之前的最后一个指令 token 作为 query，不会误用动作 token。
+- FLOPs reduction 使用与 AutoPrune 一致的逐层实际 token 数代理统计。
+
+对应单实验脚本分别位于每个方法目录：
+
+脚本从当前仓库加载 patch 和 `baseline_libero/run_libero_eval.py`，但默认复用
+`/home/liudongxu/Auto_openvla-oft` 中已有的权重、LIBERO 环境与日志目录；可通过
+`OPENVLA_OFT_RUNTIME_ROOT` 指向其他现有运行资源目录。
+
+```bash
+# FasterVLM：KEEP_VISUAL_TOKENS 是最终保留视觉 token 数
+cd integrations/openvla_oft/fastervlm
+GPU=0 TASK_SUITE_NAME=libero_goal TASK_ID=4 KEEP_VISUAL_TOKENS=448 NUM_TRIALS=20 \
+  bash run_fastervlm_oft_single.sh
+
+# VisionZip：KEEP_VISUAL_TOKENS 是 K + M + 1 的最终视觉 token 数
+cd ../visionzip
+GPU=0 TASK_SUITE_NAME=libero_goal TASK_ID=4 KEEP_VISUAL_TOKENS=448 NUM_TRIALS=20 \
+  bash run_visionzip_oft_single.sh
+
+# PyramidDrop：AVERAGE_VISUAL_TOKENS 是 decoder 各层平均视觉 token 数
+cd ../pyramiddrop
+GPU=0 TASK_SUITE_NAME=libero_goal TASK_ID=4 AVERAGE_VISUAL_TOKENS=448 NUM_TRIALS=20 \
+  bash run_pyramiddrop_oft_single.sh
+```
 
 OpenVLA-OFT 新增脚本在 `integrations/openvla_oft/scripts/`：
 
@@ -153,9 +200,9 @@ methods/baseline_pruning/mantis/
 | AutoPrune   | Active             | Active                   | Active         |
 | FastV       | Active             | Active via compare patch | Active adapter |
 | SparseVLM   | Active             | Active via compare patch | Active adapter |
-| FasterVLM   | Compare baseline   | Active via compare patch | Active adapter |
-| VisionZip   | Compare baseline   | Active via compare patch | Active adapter |
-| PyramidDrop | Compare baseline   | Active via compare patch | Active adapter |
+| FasterVLM   | Active standalone baseline | Active via compare patch | Active adapter |
+| VisionZip   | Active standalone baseline | Active via compare patch | Active adapter |
+| PyramidDrop | Active standalone baseline | Active via compare patch | Active adapter |
 | VLA-Pruner  | Active             | Active                   | Planned        |
 | VLA-ADP     | Active             | Active                   | Planned        |
 

@@ -43,7 +43,7 @@ case "${TASK_SUITE_NAME}" in
     DEFAULT_CHECKPOINT="/mnt/jarvis/migration/.cache/huggingface/hub/models--moojink--openvla-7b-oft-finetuned-libero-spatial/snapshots/6d0231af0e48c5985f1ff86908f4674b84bc049b"
     ;;
   libero_object)
-    DEFAULT_CHECKPOINT="/mnt/jarvis/migration/openvla_eval/runtime_stage50_pruned_all4_20260325_live/hf/transformers/models--moojink--openvla-7b-oft-finetuned-libero-object/snapshots/4c89574e1c538b6c102f43f0526d60a9d3650148"
+    DEFAULT_CHECKPOINT="/mnt/jarvis/migration/home/jarvis/Auto_openvla-oft/work/hf/transformers/models--moojink--openvla-7b-oft-finetuned-libero-object/snapshots/4c89574e1c538b6c102f43f0526d60a9d3650148"
     ;;
   libero_goal)
     DEFAULT_CHECKPOINT="/mnt/jarvis/migration/.cache/huggingface/hub/models--moojink--openvla-7b-oft-finetuned-libero-goal/snapshots/c2d0f9fbbd82674683b397ff923168a12f6a307b"

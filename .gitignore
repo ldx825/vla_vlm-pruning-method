@@ -79,9 +79,17 @@ tmp/
 temp/
 *.tmp
 *.bak
+*.backup
+*.backup.*
+*.back.*
 *.pid
 *.prof
 *.trace
+*.nsys-rep
+*.qdrep
+core
+core.*
+.nfs*
 *.sqlite
 *.db
 *.zip
@@ -97,6 +105,9 @@ temp/
 **/.cache/
 **/.mplconfig*/
 **/.libero_config*/
+**/libero_config/
+**/experiments/logs/
+**/experiments/rollouts/
 **/LIBERO/
 debugpy*.log
 
